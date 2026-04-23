@@ -1,0 +1,8 @@
+pyttsx3>=2.90
+sounddevice>=0.4.6
+numpy>=1.24.0
+scipy>=1.11.0
+pynput>=1.7.6
+pygame>=2.5.0
+requests>=2.31.0
+pyirsdk

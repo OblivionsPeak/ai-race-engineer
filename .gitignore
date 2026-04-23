@@ -1,0 +1,21 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec.bak
+
+# Personal config (contains account token — never commit)
+engineer_config.json
+race_plan.json
+bridge_config.json
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Temp / OS files
+=*
+~$*
+*.tmp
+Thumbs.db

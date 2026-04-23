@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy this file to engineer_config.json and fill in your values. | server_url: the Railway (or localhost:5002) URL of your endurance planner | plan_id: the numeric ID of the race plan — visible in the planner URL | anthropic_api_key: get yours from console.anthropic.com — REQUIRED | openai_api_key: get yours from platform.openai.com — only needed for voice input, leave blank to use text mode | fuel_warning_laps: laps of fuel remaining that triggers a low-fuel alert (default 3) | voice_enabled: set to false to skip microphone input and use text mode only",
+  "server_url": "https://your-app.railway.app",
+  "plan_id": "",
+  "anthropic_api_key": "",
+  "openai_api_key": "",
+  "fuel_warning_laps": 3,
+  "voice_enabled": true
+}
