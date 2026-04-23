@@ -256,6 +256,63 @@ def _calc_live_status(current_lap: int, stints: list, plan: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Auto race plan detection from iRacing session data
+# ---------------------------------------------------------------------------
+def _build_auto_plan_from_ir(ir) -> dict | None:
+    """Read iRacing session variables and return a plan dict, or None on failure."""
+    try:
+        driver_info  = ir['DriverInfo']  or {}
+        weekend_info = ir['WeekendInfo'] or {}
+        session_info = ir['SessionInfo'] or {}
+
+        capacity_l   = float(driver_info.get('DriverCarFuelMaxLtr', 0) or 0)
+        est_lap_s    = float(driver_info.get('DriverCarEstLapTime', 0) or 0)
+        driver_name  = driver_info.get('DriverUserName', 'Driver') or 'Driver'
+        track_name   = weekend_info.get('TrackDisplayName', 'Unknown Track') or 'Unknown Track'
+        car_name     = weekend_info.get('CarName', '') or weekend_info.get('SeriesName', '')
+
+        if capacity_l <= 0 or est_lap_s <= 0:
+            return None
+
+        # Find the Race session to determine duration
+        race_duration_hrs = 1.0  # fallback
+        sessions = session_info.get('Sessions', []) or []
+        for session in sessions:
+            if session.get('SessionType', '') == 'Race':
+                time_str = str(session.get('SessionTime', '') or '')
+                laps_str = str(session.get('SessionLaps', '') or '')
+                if 'sec' in time_str and 'unlimited' not in time_str:
+                    secs = float(time_str.replace('sec', '').strip())
+                    if secs > 0:
+                        race_duration_hrs = round(secs / 3600, 3)
+                        break
+                elif laps_str.isdigit() and est_lap_s > 0:
+                    race_duration_hrs = round(int(laps_str) * est_lap_s / 3600, 3)
+                    break
+
+        # Estimate fuel-per-lap as 5% of tank (placeholder; refined via rolling telemetry)
+        est_fpl = round(capacity_l * 0.05, 2)
+
+        name_parts = [track_name]
+        if car_name:
+            name_parts.append(car_name)
+        plan_name = ' · '.join(name_parts)
+
+        return {
+            'name':              plan_name,
+            'race_duration_hrs': race_duration_hrs,
+            'lap_time_s':        round(est_lap_s, 3),
+            'fuel_capacity_l':   round(capacity_l, 2),
+            'fuel_per_lap_l':    est_fpl,
+            'pit_loss_s':        35.0,
+            'auto_detected':     True,
+            'drivers':           [{'name': driver_name, 'max_hours': min(race_duration_hrs, 2.5)}],
+        }
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # iRacing telemetry thread
 # ---------------------------------------------------------------------------
 class TelemetryThread(threading.Thread):
@@ -273,21 +330,31 @@ class TelemetryThread(threading.Thread):
             self._app.set_status('error')
             return
 
-        ir           = irsdk.IRSDK()
+        ir                 = irsdk.IRSDK()
         ir.startup()
-        last_fpl_lap = 0
-        prev_fuel    = None
-        fuel_history = []
+        last_fpl_lap       = 0
+        prev_fuel          = None
+        fuel_history       = []
+        auto_plan_detected = False
 
         while not self._stop.is_set():
             try:
                 if not ir.is_initialized or not ir.is_connected:
                     self._app.set_status('connecting')
+                    auto_plan_detected = False
                     ir.startup()
                     self._stop.wait(2)
                     continue
 
                 ir.freeze_var_buffer_latest()
+
+                # Auto-detect race plan once per connection if no manual plan exists
+                if not auto_plan_detected:
+                    auto_plan = _build_auto_plan_from_ir(ir)
+                    if auto_plan:
+                        auto_plan_detected = True
+                        self._app.after(0, lambda p=auto_plan: self._app._apply_auto_plan(p))
+
                 plan      = self._app._plan
                 stints    = self._app._stints
                 fuel_unit = self._app._cfg.get('fuel_unit', 'gal')
@@ -308,11 +375,15 @@ class TelemetryThread(threading.Thread):
                     if 0.05 < actual_fpl < 5.0:
                         fuel_history.append(actual_fpl)
                         fuel_history = fuel_history[-10:]
+                        avg_fpl = round(sum(fuel_history) / len(fuel_history), 4)
                         fuel_delta = {
-                            'avg_actual_fpl':  round(sum(fuel_history) / len(fuel_history), 4),
+                            'avg_actual_fpl':  avg_fpl,
                             'last_actual_fpl': actual_fpl,
                             'history':         list(fuel_history),
                         }
+                        # Update auto-detected plan's FPL once we have 3+ laps of data
+                        if len(fuel_history) >= 3 and self._app._plan.get('auto_detected'):
+                            self._app.after(0, lambda f=avg_fpl: self._app._update_auto_fpl(f))
                     last_fpl_lap = lap_completed
                 prev_fuel = fuel
 
@@ -517,8 +588,47 @@ class App(tk.Tk):
         self._show_wizard()
 
     def _update_plan_display(self):
-        name = self._plan.get('name', 'Unnamed Plan') if self._plan else 'No plan loaded'
-        self.v_plan_name.set(name)
+        plan = self._plan
+        if not plan:
+            self.v_plan_name.set('No plan loaded')
+            return
+        name = plan.get('name', 'Unnamed Plan')
+        if plan.get('auto_detected'):
+            self.v_plan_name.set(f'Auto: {name}')
+        else:
+            self.v_plan_name.set(name)
+
+    def _apply_auto_plan(self, plan: dict):
+        """Apply an auto-detected plan from iRacing — only if no manual plan is loaded."""
+        if self._plan and not self._plan.get('auto_detected'):
+            return  # manual plan takes priority
+        try:
+            stints       = _calculate_stints(plan)
+            self._plan   = plan
+            self._stints = stints
+            self._update_plan_display()
+            self.log(
+                f'[AUTO] Race detected: {plan["name"]}  '
+                f'{plan["race_duration_hrs"]}h  '
+                f'Tank: {plan["fuel_capacity_l"]}L  '
+                f'Est.FPL: {plan["fuel_per_lap_l"]}L (refining…)'
+            )
+        except Exception as e:
+            self.log(f'[AUTO] Plan apply error: {e}')
+
+    def _update_auto_fpl(self, avg_fpl: float):
+        """Refine the auto-detected fuel-per-lap from rolling telemetry data."""
+        if not self._plan or not self._plan.get('auto_detected'):
+            return
+        if abs(self._plan.get('fuel_per_lap_l', 0) - avg_fpl) < 0.001:
+            return  # no meaningful change
+        self._plan['fuel_per_lap_l'] = avg_fpl
+        try:
+            self._stints = _calculate_stints(self._plan)
+            self._update_plan_display()
+            self.log(f'[AUTO] Fuel/lap refined to {avg_fpl}L from telemetry.')
+        except Exception:
+            pass
 
     def _rebind_ptt(self):
         """Open a modal dialog that captures the next key or joystick button press."""
@@ -1161,34 +1271,33 @@ class App(tk.Tk):
             self._show_wizard()
             return
 
-        # ── Load race plan ────────────────────────────────────────────────
-        if not os.path.exists(PLAN_PATH):
-            self.log('No race plan found. Click Edit Plan to set up your race.')
-            self._show_plan_editor()
-            return
+        # ── Load race plan (manual plan takes priority; auto-detection fills in if absent) ──
+        plan = None
+        if os.path.exists(PLAN_PATH):
+            try:
+                with open(PLAN_PATH) as f:
+                    plan = json.load(f)
+                required = ('race_duration_hrs', 'fuel_capacity_l', 'fuel_per_lap_l', 'lap_time_s')
+                missing  = [k for k in required if k not in plan]
+                if missing:
+                    self.log(f'Race plan missing fields {missing} — will use auto-detection.')
+                    plan = None
+            except Exception as e:
+                self.log(f'Could not load race plan ({e}) — will use auto-detection.')
 
-        try:
-            with open(PLAN_PATH) as f:
-                plan = json.load(f)
-        except Exception as e:
-            self.log(f'Failed to load race plan: {e}')
-            return
+        if plan:
+            try:
+                stints = _calculate_stints(plan)
+            except Exception as e:
+                self.log(f'Stint calculation error: {e}')
+                return
+            self._plan   = plan
+            self._stints = stints
+        else:
+            self._plan   = {}
+            self._stints = []
+            self.log('[AUTO] No manual plan — will detect race from iRacing when you join a session.')
 
-        required = ('race_duration_hrs', 'fuel_capacity_l', 'fuel_per_lap_l', 'lap_time_s')
-        missing  = [k for k in required if k not in plan]
-        if missing:
-            self.log(f'Race plan is missing required fields: {missing}')
-            return
-
-        # ── Calculate stints ─────────────────────────────────────────────
-        try:
-            stints = _calculate_stints(plan)
-        except Exception as e:
-            self.log(f'Stint calculation error: {e}')
-            return
-
-        self._plan   = plan
-        self._stints = stints
         self._update_plan_display()
 
         # ── Save relevant cfg prefs ───────────────────────────────────────
@@ -1239,16 +1348,20 @@ class App(tk.Tk):
         self.stop_btn.config(state='normal')
 
         # ── Log plan summary ──────────────────────────────────────────────
-        drivers = plan.get('drivers', [])
         self.log(f'─── Engineer started ─── {time.strftime("%H:%M:%S")} ───')
-        self.log(
-            f'Plan  : {plan.get("name", "?")}  |  '
-            f'Duration: {plan.get("race_duration_hrs", "?")}h  |  '
-            f'Stints: {len(stints)}  |  '
-            f'Drivers: {len(drivers)}'
-        )
-        for i, d in enumerate(drivers, 1):
-            self.log(f'  Driver {i}: {d.get("name", "?")}  (max {d.get("max_hours", "?")}h)')
+        if self._plan:
+            p       = self._plan
+            drivers = p.get('drivers', [])
+            self.log(
+                f'Plan  : {p.get("name", "?")}  |  '
+                f'Duration: {p.get("race_duration_hrs", "?")}h  |  '
+                f'Stints: {len(self._stints)}  |  '
+                f'Drivers: {len(drivers)}'
+            )
+            for i, d in enumerate(drivers, 1):
+                self.log(f'  Driver {i}: {d.get("name", "?")}  (max {d.get("max_hours", "?")}h)')
+        else:
+            self.log('Waiting for iRacing — race plan will be detected automatically.')
 
     def stop_engineer(self):
         self._stop_evt.set()
