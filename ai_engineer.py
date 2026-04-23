@@ -15,7 +15,7 @@ import subprocess
 import sys
 
 # ── Backend server URL — update this before building the public EXE ──────────
-BACKEND_URL = "https://endurance-planner-production.railway.app"
+BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Auto-install missing packages before anything else ──────────────────────
