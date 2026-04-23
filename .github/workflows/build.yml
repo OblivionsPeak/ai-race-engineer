@@ -1,0 +1,51 @@
+name: Build & Release EXE
+
+on:
+  push:
+    tags:
+      - 'v*'          # triggers on any tag like v1.0.0, v1.2.3
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements_engineer.txt
+
+      - name: Build EXE
+        run: python -m PyInstaller engineer.spec --noconfirm
+
+      - name: Upload EXE to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AIRaceEngineer.exe
+          body: |
+            ## AI Race Engineer ${{ github.ref_name }}
+
+            **Download AIRaceEngineer.exe below — no Python or setup required.**
+
+            ### First run
+            1. Download and run `AIRaceEngineer.exe`
+            2. Create a free account in the setup wizard
+            3. Fill in your race plan details
+            4. Start iRacing, then press Start in the engineer
+
+            ### Requirements
+            - Windows 10/11
+            - iRacing
+            - Microphone (for voice input)
+            - Free OpMo account (created in-app — no API keys needed)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
