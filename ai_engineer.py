@@ -447,6 +447,7 @@ class App(tk.Tk):
         self._telemetry_thread: TelemetryThread | None = None
         self._spotter_thread     = None
         self._last_fuel_alert    = 0.0
+        self._ptt_down           = False
         self._last_pit_alert     = 0.0
         self._last_overdue_alert = 0.0
         self._joystick_thread: threading.Thread | None = None
@@ -680,29 +681,49 @@ class App(tk.Tk):
         # Joystick polling thread
         def joy_poll():
             if not PYGAME_AVAILABLE:
+                self.after(0, lambda: status_var.set('pygame not available — keyboard only'))
                 return
             try:
-                pygame.init()
+                if not pygame.get_init():
+                    pygame.init()
                 pygame.joystick.init()
-                joysticks = [pygame.joystick.Joystick(i)
-                             for i in range(pygame.joystick.get_count())]
-                for j in joysticks:
+                count = pygame.joystick.get_count()
+                if count == 0:
+                    self.after(0, lambda: status_var.set('No joystick found — press a keyboard key'))
+                    return
+                joysticks = []
+                for i in range(count):
+                    j = pygame.joystick.Joystick(i)
                     j.init()
+                    joysticks.append(j)
+                names = ', '.join(j.get_name() for j in joysticks)
+                self.after(0, lambda n=names: status_var.set(f'Found: {n}\nPress a wheel button…'))
+                # Snapshot button states so we don't fire on already-held buttons
+                pygame.event.pump()
+                initial = {j.get_id(): [j.get_button(b) for b in range(j.get_numbuttons())]
+                           for j in joysticks}
+                time.sleep(0.05)
                 while not detected['done']:
                     pygame.event.pump()
                     for j in joysticks:
+                        jid = j.get_id()
                         for b in range(j.get_numbuttons()):
-                            if j.get_button(b) and not detected['done']:
+                            was_down = initial.get(jid, [False]*100)[b] if b < len(initial.get(jid, [])) else False
+                            if j.get_button(b) and not was_down and not detected['done']:
                                 binding = {'type': 'joystick',
+                                           'device_name': j.get_name(),
                                            'device': j.get_id(), 'button': b}
-                                label   = f'JOY{j.get_id()} BTN{b}'
+                                label   = f'{j.get_name()} BTN{b}'
                                 if kb_listener[0]:
-                                    kb_listener[0].stop()
+                                    try:
+                                        kb_listener[0].stop()
+                                    except Exception:
+                                        pass
                                 finish(binding, label)
                                 return
                     time.sleep(0.01)
-            except Exception:
-                pass
+            except Exception as e:
+                self.after(0, lambda err=e: status_var.set(f'Joystick error: {err}'))
 
         threading.Thread(target=joy_poll, daemon=True).start()
 
@@ -1508,25 +1529,57 @@ class App(tk.Tk):
         self._recording    = False
         self._audio_chunks = []
         self._ptt_down     = False
-        device_idx = binding.get('device', 0)
-        button_idx = binding.get('button', 0)
+        button_idx   = binding.get('button', 0)
+        stored_name  = binding.get('device_name', '')
+        stored_idx   = binding.get('device', 0)
+
+        def _find_joystick():
+            """Return the joystick matching the bound device (by name, then by index)."""
+            count = pygame.joystick.get_count()
+            if count == 0:
+                return None
+            # Try to match by name first (survives USB re-plug / index shifts)
+            if stored_name:
+                for i in range(count):
+                    j = pygame.joystick.Joystick(i)
+                    j.init()
+                    if j.get_name() == stored_name:
+                        return j
+            # Fall back to stored index
+            if stored_idx < count:
+                j = pygame.joystick.Joystick(stored_idx)
+                j.init()
+                return j
+            # Last resort: first available
+            j = pygame.joystick.Joystick(0)
+            j.init()
+            return j
 
         def joy_loop():
             try:
-                pygame.init()
+                if not pygame.get_init():
+                    pygame.init()
                 pygame.joystick.init()
-                joy = None
-                if pygame.joystick.get_count() > device_idx:
-                    joy = pygame.joystick.Joystick(device_idx)
-                    joy.init()
-                    self.log(f'Joystick: {joy.get_name()} — button {button_idx}')
-                else:
-                    self.log(f'Warning: joystick device {device_idx} not found')
+                joy = _find_joystick()
+                if joy is None:
+                    self.log('PTT: no joystick found — reconnect wheel and restart engineer')
                     return
+                self.log(f'PTT: {joy.get_name()} button {button_idx}')
 
                 while not self._stop_evt.is_set():
-                    pygame.event.pump()
-                    btn_down = joy.get_button(button_idx) if joy else False
+                    try:
+                        pygame.event.pump()
+                        btn_down = joy.get_button(button_idx)
+                    except Exception:
+                        # Device disconnected — try to re-find it
+                        pygame.joystick.quit()
+                        pygame.joystick.init()
+                        joy = _find_joystick()
+                        if joy is None:
+                            time.sleep(2)
+                            continue
+                        btn_down = False
+
                     if btn_down and not self._ptt_down and self._running:
                         self._ptt_down = True
                         self._start_recording()
@@ -1535,7 +1588,7 @@ class App(tk.Tk):
                         self._stop_recording()
                     time.sleep(0.01)
             except Exception as e:
-                self.log(f'Joystick error: {e}')
+                self.log(f'Joystick PTT error: {e}')
 
         self._joystick_thread = threading.Thread(target=joy_loop, daemon=True)
         self._joystick_thread.start()
