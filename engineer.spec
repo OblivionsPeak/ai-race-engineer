@@ -2,16 +2,27 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+import sys
 
 block_cipher = None
+
+# Locate the sounddevice portaudio DLL manually (PyInstaller 6.x compatible)
+def _find_portaudio():
+    try:
+        import sounddevice, pathlib
+        sd_dir = pathlib.Path(sounddevice.__file__).parent
+        dlls = list(sd_dir.glob('*portaudio*')) + list(sd_dir.glob('_sounddevice_data/**/*portaudio*'))
+        return [(str(d), '.') for d in dlls if d.is_file()]
+    except Exception:
+        return []
+
+portaudio_binaries = _find_portaudio()
 
 a = Analysis(
     ['ai_engineer.py'],
     pathex=['.'],
-    binaries=[],
-    datas=[
-        # Include sounddevice portaudio DLL if present
-    ],
+    binaries=portaudio_binaries,
+    datas=[],
     hiddenimports=[
         'pyttsx3',
         'pyttsx3.drivers',
@@ -24,15 +35,24 @@ a = Analysis(
         'pynput.mouse',
         'pynput.mouse._win32',
         'sounddevice',
+        '_sounddevice_data',
+        'scipy',
         'scipy.signal',
+        'scipy.io',
         'scipy.io.wavfile',
+        'scipy.special._special_ufuncs',
+        'scipy.special._cdflib',
         'numpy',
+        'numpy.core._multiarray_umath',
         'tkinter',
         'tkinter.ttk',
         'tkinter.scrolledtext',
         'tkinter.filedialog',
         'irsdk',
         'requests',
+        'urllib3',
+        'certifi',
+        'charset_normalizer',
         'pygame',
         'pygame.joystick',
         'pygame.event',
@@ -41,21 +61,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['matplotlib', 'PIL', 'cv2', 'pandas'],
+    excludes=['matplotlib', 'PIL', 'cv2', 'pandas', 'anthropic', 'openai'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
     noarchive=False,
 )
-
-# Collect all files from packages that need them
-from PyInstaller.utils.hooks import collect_all, collect_data_files
-
-for pkg in ['sounddevice', 'scipy']:
-    datas_pkg, binaries_pkg, hiddenimports_pkg = collect_all(pkg)
-    a.datas    += datas_pkg
-    a.binaries += binaries_pkg
-    a.hiddenimports += hiddenimports_pkg
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
