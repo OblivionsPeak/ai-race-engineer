@@ -1,10 +1,9 @@
 @echo off
-title Build AI Race Engineer EXE — OpMo eSports
+title Build Neural Racing Performance EXE
 cd /d "%~dp0"
 
 echo ============================================
-echo   AI Race Engineer — EXE Build
-echo   OpMo eSports
+echo   Neural Racing Performance — EXE Build
 echo ============================================
 echo.
 
@@ -23,7 +22,7 @@ echo.
 
 echo [2/3] Cleaning previous build...
 if exist build rmdir /s /q build
-if exist dist\AIRaceEngineer.exe del /q dist\AIRaceEngineer.exe
+if exist dist\NeuralRacingPerformance.exe del /q dist\NeuralRacingPerformance.exe
 echo Done.
 echo.
 
@@ -31,13 +30,13 @@ echo [3/3] Building EXE (this takes 2-5 minutes)...
 %PYTHON% -m PyInstaller engineer.spec --noconfirm
 echo.
 
-if exist dist\AIRaceEngineer.exe (
+if exist dist\NeuralRacingPerformance.exe (
     echo ============================================
     echo   BUILD SUCCESSFUL
-    echo   Output: dist\AIRaceEngineer.exe
+    echo   Output: dist\NeuralRacingPerformance.exe
     echo ============================================
     echo.
-    echo You can copy AIRaceEngineer.exe anywhere and run it.
+    echo You can copy NeuralRacingPerformance.exe anywhere and run it.
     echo On first run, place engineer_config.json and race_plan.json
     echo in the same folder as the EXE.
 ) else (

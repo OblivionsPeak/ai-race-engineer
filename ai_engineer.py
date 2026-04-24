@@ -1,5 +1,5 @@
 """
-Endurance Race Planner — AI Race Engineer (Standalone)
+Neural Racing Performance — AI Race Engineer (Standalone)
 =======================================================
 Push-to-talk voice assistant + proactive alerts via backend proxy.
 Reads iRacing telemetry directly via pyirsdk. No direct Anthropic/OpenAI
@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.3"
+VERSION     = "1.1.4"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -100,15 +100,16 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Colors  (identical to telemetry_bridge.py)
 # ---------------------------------------------------------------------------
-BG     = '#07101f'
-BG2    = '#0c1830'
-BG3    = '#122040'
-BORDER = '#1a2f52'
-ACCENT = '#c8192e'
-GREEN  = '#3ecf8e'
-YELLOW = '#f5c542'
-TEXT   = '#edf1ff'
-DIM    = '#6e85b0'
+BG     = '#050d12'
+BG2    = '#091820'
+BG3    = '#0d2430'
+BORDER = '#174858'
+ACCENT = '#00c8d4'
+GREEN  = '#00d890'
+YELLOW = '#f0c040'
+TEXT   = '#cce8ec'
+DIM    = '#3a7080'
+CYAN   = '#48f8f8'
 
 
 # ---------------------------------------------------------------------------
@@ -618,10 +619,19 @@ def _apply_update(new_exe_path: str):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Endurance Race Planner — AI Race Engineer')
+        self.title('Neural Racing Performance')
         self.configure(bg=BG)
         self.resizable(True, True)
         self.minsize(560, 720)
+        # Set window + taskbar icon
+        try:
+            _ico = os.path.join(
+                getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))),
+                'ai_race_engineer.ico')
+            if os.path.exists(_ico):
+                self.iconbitmap(_ico)
+        except Exception:
+            pass
 
         cfg = load_config()
 
@@ -737,13 +747,74 @@ class App(tk.Tk):
     # ── UI builders ──────────────────────────────────────────────────────────
 
     def _build_header(self):
-        hdr = ttk.Frame(self)
-        hdr.pack(fill='x', pady=(14, 8), padx=14)
-        tk.Label(hdr, text='⬡', bg=BG, fg=ACCENT, font=('Segoe UI', 18)).pack(side='left')
-        tk.Label(hdr, text='  AI RACE ENGINEER', bg=BG, fg=TEXT,
-                 font=('Segoe UI', 12, 'bold')).pack(side='left')
-        tk.Label(hdr, text='OpMo eSports', bg=BG, fg=DIM,
-                 font=('Segoe UI', 9)).pack(side='left', padx=(8, 0))
+        self._hdr_canvas = tk.Canvas(self, bg=BG, highlightthickness=0, height=68)
+        self._hdr_canvas.pack(fill='x', pady=(10, 4))
+        self._hdr_canvas.bind('<Configure>', lambda e: self._draw_header_circuits())
+        # Title drawn on canvas so it sits above the circuit traces
+        self._hdr_title  = self._hdr_canvas.create_text(
+            54, 30, text='NEURAL RACING PERFORMANCE',
+            fill=TEXT, font=('Segoe UI', 11, 'bold'), anchor='w')
+        self._hdr_sub    = self._hdr_canvas.create_text(
+            54, 48, text='AI Race Engineer',
+            fill=DIM, font=('Segoe UI', 8), anchor='w')
+        self._hdr_icon   = self._hdr_canvas.create_text(
+            20, 34, text='◈', fill=CYAN, font=('Segoe UI', 22), anchor='w')
+
+    def _draw_header_circuits(self):
+        c = self._hdr_canvas
+        c.delete('circuit')
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 10:
+            return
+
+        TRACE  = '#0c2e3a'   # dark trace line
+        TRACE2 = '#164858'   # slightly brighter trace
+        NODE   = CYAN        # bright via
+        PAD    = '#0f3040'   # dim square pad
+
+        # Three horizontal bus lines
+        buses = [int(h * f) for f in (0.18, 0.52, 0.84)]
+        for y in buses:
+            c.create_line(0, y, w, y, fill=TRACE, width=1, tags='circuit')
+
+        # Vertical traces at regular intervals, only on right 40% to avoid title text
+        step = max(22, w // 20)
+        for xi in range(0, w, step):
+            if xi < w * 0.55:
+                continue   # leave room for title text on left
+            x = xi
+            # Vary which buses get connected
+            bucket = (x // step) % 3
+            if bucket == 0:
+                c.create_line(x, buses[0], x, buses[1], fill=TRACE, width=1, tags='circuit')
+            elif bucket == 1:
+                c.create_line(x, buses[1], x, buses[2], fill=TRACE, width=1, tags='circuit')
+            else:
+                c.create_line(x, buses[0], x, buses[2], fill=TRACE2, width=1, tags='circuit')
+
+            # Draw pads / vias at intersections
+            for idx, y in enumerate(buses):
+                kind = (x // step + idx) % 4
+                if kind == 0:
+                    c.create_rectangle(x-2, y-2, x+2, y+2, fill=PAD, outline=TRACE2, tags='circuit')
+                elif kind == 1:
+                    c.create_oval(x-3, y-3, x+3, y+3, fill=NODE, outline='', tags='circuit')
+
+        # Small IC chip rectangle on the far right
+        if w > 200:
+            ix = w - 28
+            c.create_rectangle(ix-10, 10, ix+10, h-10, fill=PAD, outline=TRACE2, width=1, tags='circuit')
+            for pf in (0.30, 0.52, 0.74):
+                py = int(h * pf)
+                c.create_line(ix-10, py, ix-16, py, fill=TRACE2, width=1, tags='circuit')
+                c.create_line(ix+10, py, ix+16, py, fill=TRACE2, width=1, tags='circuit')
+
+        # Raise title text above circuits
+        c.tag_raise('title')  # re-raise title items — they have no tag, use specific IDs
+        c.lift(self._hdr_title)
+        c.lift(self._hdr_sub)
+        c.lift(self._hdr_icon)
 
     def _build_config(self, cfg: dict):
         frm = ttk.LabelFrame(self, text='SETTINGS', padding=10)
@@ -1302,8 +1373,8 @@ class App(tk.Tk):
         # ── Step 1: Welcome ──────────────────────────────────────────────
         def show_welcome():
             clear()
-            label(container, 'Welcome to AI Race Engineer', size=14, bold=True, pady=(0, 4))
-            label(container, 'By OpMo eSports', size=9, color=DIM, pady=(0, 20))
+            label(container, 'Welcome to Neural Racing Performance', size=14, bold=True, pady=(0, 4))
+            label(container, 'AI Race Engineer', size=9, color=DIM, pady=(0, 20))
             label(container, 'Get live strategy advice and spotter callouts\npowered by AI — directly in iRacing.', size=10, color=DIM, pady=(0, 30))
             ttk.Button(container, text='Create Free Account', style='Wizard.TButton',
                        command=show_register).pack(fill='x', pady=(0, 8))

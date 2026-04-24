@@ -22,7 +22,7 @@ a = Analysis(
     ['ai_engineer.py'],
     pathex=['.'],
     binaries=portaudio_binaries,
-    datas=[],
+    datas=[('ai_race_engineer.ico', '.')] if os.path.exists('ai_race_engineer.ico') else [],
     hiddenimports=[
         'pyttsx3',
         'pyttsx3.drivers',
@@ -84,7 +84,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='AIRaceEngineer',
+    name='NeuralRacingPerformance',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
