@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.0.7"
+VERSION     = "1.0.8"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages before anything else ──────────────────────
@@ -451,8 +451,10 @@ class TelemetryThread(threading.Thread):
 
                 # Build opponents dict
                 opponents = {}
+                my_position = None
                 try:
                     my_pos   = car_idx_positions[my_car_idx] if my_car_idx < len(car_idx_positions) else 0
+                    my_position = my_pos if my_pos > 0 else None
                     drivers  = driver_info.get('Drivers', []) or []
                     idx_map  = {d.get('CarIdx', -1): d.get('UserName', '?') for d in drivers}
 
@@ -470,6 +472,7 @@ class TelemetryThread(threading.Thread):
                     behind = _find_car_at_pos(my_pos + 1)
                     if behind:
                         opponents['behind'] = behind
+                    opponents['my_position'] = my_position
                 except Exception:
                     pass
 
@@ -617,6 +620,8 @@ class App(tk.Tk):
         self._convo_history: list = []
         self._session_notes: list = []
         self._session_memory_summary: str = ''
+        self._server_session_id: int | None = None
+        self._session_started   = False
         self._session_best_lap: float = 0.0
         self._lap_times_this_session: list = []
         self._last_coached_lap: int = 0
@@ -898,6 +903,12 @@ class App(tk.Tk):
                 f'Tank: {plan["fuel_capacity_l"]}L  '
                 f'Est.FPL: {plan["fuel_per_lap_l"]}L (refining…)'
             )
+            # Start server session now that we know the track
+            plan_name = plan.get('name', '')
+            parts     = plan_name.split(' · ')
+            track     = parts[0] if parts else plan_name
+            car       = parts[1] if len(parts) > 1 else ''
+            self._start_server_session(track, car)
         except Exception as e:
             self.log(f'[AUTO] Plan apply error: {e}')
 
@@ -1177,7 +1188,7 @@ class App(tk.Tk):
             # Plan missing — open wizard at plan step
             self._show_wizard(start_at_plan=True)
 
-        self._load_session_memory()
+        self._load_history_from_server()
 
     # ── First-run wizard ─────────────────────────────────────────────────────
 
@@ -1640,6 +1651,119 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _start_server_session(self, track_name: str, car_name: str):
+        """Register a new session with the backend DB. Fires once per iRacing connect."""
+        if self._session_started:
+            return
+        self._session_started = True
+        token = self._cfg.get('token', '')
+        if not token:
+            return
+        plan = self._plan or {}
+        def _do():
+            try:
+                r = requests.post(
+                    f'{BACKEND_URL}/engineer/session/start',
+                    json={
+                        'token':             token,
+                        'track_name':        track_name,
+                        'car_name':          car_name,
+                        'race_duration_hrs': plan.get('race_duration_hrs', 0),
+                    },
+                    timeout=8,
+                )
+                if r.ok:
+                    self._server_session_id = r.json().get('session_id')
+                    self.log(f'[HISTORY] Session {self._server_session_id} started.')
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _record_server_lap(self, lap_num: int, lap_time_s: float,
+                            fuel_used_l: float | None, position: int | None):
+        """Send a completed lap to the backend DB. Fire-and-forget."""
+        if not self._server_session_id:
+            return
+        token = self._cfg.get('token', '')
+        if not token:
+            return
+        def _do():
+            try:
+                requests.post(
+                    f'{BACKEND_URL}/engineer/session/lap',
+                    json={
+                        'token':       token,
+                        'session_id':  self._server_session_id,
+                        'lap_num':     lap_num,
+                        'lap_time_s':  lap_time_s,
+                        'fuel_used_l': fuel_used_l,
+                        'position':    position,
+                    },
+                    timeout=6,
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _end_server_session(self):
+        """Finalise the session record in the backend DB."""
+        if not self._server_session_id:
+            return
+        token = self._cfg.get('token', '')
+        if not token:
+            return
+        sid = self._server_session_id
+        self._server_session_id = None
+        self._session_started   = False
+        def _do():
+            try:
+                requests.post(
+                    f'{BACKEND_URL}/engineer/session/end',
+                    json={
+                        'token':        token,
+                        'session_id':   sid,
+                        'total_stints': len(self._stints),
+                    },
+                    timeout=8,
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _load_history_from_server(self):
+        """Fetch session history from backend; fall back to local JSON on failure."""
+        token = self._cfg.get('token', '')
+        if not token:
+            self._load_session_memory()
+            return
+        def _do():
+            try:
+                r = requests.get(
+                    f'{BACKEND_URL}/engineer/history',
+                    params={'token': token},
+                    timeout=8,
+                )
+                if r.ok:
+                    sessions = r.json().get('sessions', [])
+                    if sessions:
+                        lines = ['PAST SESSIONS (most recent first):']
+                        for s in sessions[:5]:
+                            best  = f"{s['best_lap_s']:.3f}s" if s.get('best_lap_s') else '?'
+                            fpl   = f"{s['avg_fpl_l']:.2f}L/lap" if s.get('avg_fpl_l') else '?'
+                            laps  = s.get('total_laps', '?')
+                            lines.append(
+                                f"- {s.get('session_date','?')} | {s.get('track_name','?')} | "
+                                f"Best: {best} | FPL: {fpl} | {laps} laps"
+                            )
+                        self._session_memory_summary = '\n'.join(lines)
+                        self.log(f'[HISTORY] Loaded {len(sessions)} past sessions.')
+                        return
+            except Exception:
+                pass
+            # Fallback to local JSON
+            self._load_session_memory()
+        threading.Thread(target=_do, daemon=True).start()
+
     def _add_session_note(self, note: str):
         self._session_notes.append(note)
         if len(self._session_notes) > 20:
@@ -1747,6 +1871,7 @@ class App(tk.Tk):
             self.log('Waiting for iRacing — race plan will be detected automatically.')
 
     def stop_engineer(self):
+        self._end_server_session()
         self._stop_evt.set()
         self._running = False
 
@@ -2205,6 +2330,12 @@ class App(tk.Tk):
 
         self._last_coached_lap = lap_num
 
+        # Read current position from context for the lap record
+        with self._ctx_lock:
+            ctx = self._ctx
+        pos = ctx.get('telemetry', {}).get('opponents', {}).get('my_position') if ctx else None
+        self._record_server_lap(lap_num, lap_time, fpl, pos)
+
         is_pb = (lap_time == self._session_best_lap and len(self._lap_times_this_session) > 1)
         recent = self._lap_times_this_session[-5:]
         avg    = sum(recent) / len(recent) if recent else lap_time
@@ -2349,6 +2480,7 @@ class App(tk.Tk):
         self.after(0, _append)
 
     def on_close(self):
+        self._end_server_session()
         if self._session_best_lap > 0 or self._lap_times_this_session:
             self._save_session_memory()
         self.stop_engineer()
