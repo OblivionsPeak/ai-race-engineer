@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.4"
+VERSION     = "1.1.5"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -107,8 +107,8 @@ BORDER = '#174858'
 ACCENT = '#00c8d4'
 GREEN  = '#00d890'
 YELLOW = '#f0c040'
-TEXT   = '#cce8ec'
-DIM    = '#3a7080'
+TEXT   = '#eaf7f9'
+DIM    = '#68b8c4'
 CYAN   = '#48f8f8'
 
 
@@ -670,8 +670,8 @@ class App(tk.Tk):
         style.theme_use('clam')
         style.configure('TLabel',      background=BG,  foreground=TEXT, font=('Segoe UI', 9))
         style.configure('TFrame',      background=BG)
-        style.configure('TLabelframe', background=BG2, foreground=DIM, relief='flat')
-        style.configure('TLabelframe.Label', background=BG2, foreground=DIM,
+        style.configure('TLabelframe', background=BG2, foreground=TEXT, relief='flat')
+        style.configure('TLabelframe.Label', background=BG2, foreground=TEXT,
                         font=('Segoe UI', 8, 'bold'))
         style.configure('TEntry',      fieldbackground=BG3, foreground=TEXT,
                         insertcolor=TEXT, bordercolor=BORDER, relief='flat')
