@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.0.4"
+VERSION     = "1.0.5"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages before anything else ──────────────────────
@@ -38,9 +38,12 @@ _ensure('numpy')
 _ensure('scipy')
 _ensure('pynput')
 _ensure('pygame')
+_ensure('edge-tts', 'edge_tts')
 # Note: anthropic and openai are no longer needed client-side
 # ── Now safe to import ───────────────────────────────────────────────────────
 
+import asyncio
+import queue
 import requests
 import tempfile
 import threading
@@ -61,6 +64,12 @@ try:
     TTS_AVAILABLE = True
 except ImportError:
     TTS_AVAILABLE = False
+
+try:
+    import edge_tts
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    EDGE_TTS_AVAILABLE = False
 
 try:
     import sounddevice as sd
@@ -108,6 +117,18 @@ APPDATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), '
 CONFIG_PATH = os.path.join(APPDATA_DIR, 'config.json')
 PLAN_PATH   = os.path.join(APPDATA_DIR, 'race_plan.json')
 
+EDGE_VOICES = {
+    'en-US-AriaNeural    (US Female)':    'en-US-AriaNeural',
+    'en-US-GuyNeural     (US Male)':      'en-US-GuyNeural',
+    'en-GB-SoniaNeural   (UK Female)':    'en-GB-SoniaNeural',
+    'en-GB-RyanNeural    (UK Male)':      'en-GB-RyanNeural',
+    'en-AU-NatashaNeural (AU Female)':    'en-AU-NatashaNeural',
+    'en-AU-WilliamNeural (AU Male)':      'en-AU-WilliamNeural',
+    'en-IE-EmilyNeural   (Irish Female)': 'en-IE-EmilyNeural',
+    'SAPI5 (built-in, offline)':          'sapi5',
+}
+DEFAULT_VOICE = 'en-GB-RyanNeural'
+
 DEFAULTS = {
     'token':             '',
     'display_name':      '',
@@ -115,6 +136,7 @@ DEFAULTS = {
     'fuel_unit':         'gal',
     'ptt_binding':       {'type': 'keyboard', 'key': 'space'},
     'spotter_enabled':   True,
+    'tts_voice':         DEFAULT_VOICE,
 }
 
 # Create AppData directory on startup if it doesn't exist
@@ -564,6 +586,16 @@ class App(tk.Tk):
         self.v_acct_label = tk.StringVar(value=self._display_name or '(not logged in)')
         self.v_queries    = tk.StringVar(value='— / — queries today')
         self.v_plan_name  = tk.StringVar(value='No plan loaded')
+        # Voice: store the display label, resolve to voice ID when saving
+        saved_voice = self._cfg.get('tts_voice', DEFAULT_VOICE)
+        voice_label = next((k for k, v in EDGE_VOICES.items() if v == saved_voice),
+                           list(EDGE_VOICES.keys())[0])
+        self.v_voice = tk.StringVar(value=voice_label)
+
+        # ── TTS queue (single engine, no double-speak) ────────────────────
+        self._tts_queue  = queue.Queue()
+        self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
+        self._tts_thread.start()
 
         # ── Build UI ─────────────────────────────────────────────────────
         self._build_header()
@@ -636,8 +668,16 @@ class App(tk.Tk):
                           state='readonly', width=6)
         cb.grid(row=4, column=1, sticky='w', pady=3)
 
-        # Row 5: Spotter
-        ttk.Label(frm, text='Spotter').grid(row=5, column=0, sticky='w', pady=3, padx=(0, 10))
+        # Row 5: Voice
+        ttk.Label(frm, text='Voice').grid(row=5, column=0, sticky='w', pady=3, padx=(0, 10))
+        voice_cb = ttk.Combobox(frm, textvariable=self.v_voice,
+                                values=list(EDGE_VOICES.keys()),
+                                state='readonly', width=32)
+        voice_cb.grid(row=5, column=1, sticky='ew', pady=3, columnspan=2)
+        voice_cb.bind('<<ComboboxSelected>>', lambda _: self._save_voice_pref())
+
+        # Row 6: Spotter
+        ttk.Label(frm, text='Spotter').grid(row=6, column=0, sticky='w', pady=3, padx=(0, 10))
         tk.Checkbutton(
             frm, text='Enable spotter callouts',
             variable=self.v_spotter,
@@ -645,10 +685,15 @@ class App(tk.Tk):
             activebackground=BG2, activeforeground=TEXT,
             font=('Segoe UI', 9),
             command=self._save_spotter_pref,
-        ).grid(row=5, column=1, sticky='w', pady=3, columnspan=2)
+        ).grid(row=6, column=1, sticky='w', pady=3, columnspan=2)
 
     def _save_spotter_pref(self):
         self._cfg['spotter_enabled'] = self.v_spotter.get()
+        save_config(self._cfg)
+
+    def _save_voice_pref(self):
+        label = self.v_voice.get()
+        self._cfg['tts_voice'] = EDGE_VOICES.get(label, DEFAULT_VOICE)
         save_config(self._cfg)
 
     def _check_for_update(self):
@@ -1946,18 +1991,50 @@ class App(tk.Tk):
     # ── TTS ───────────────────────────────────────────────────────────────────
 
     def speak(self, text: str):
-        """Speak text via pyttsx3 in a background thread (non-blocking)."""
-        if not TTS_AVAILABLE:
-            return
-        def _do():
+        """Queue text for speaking — never blocks, never double-plays."""
+        self._tts_queue.put(text)
+
+    def _tts_worker(self):
+        """Single persistent TTS thread — processes one utterance at a time."""
+        sapi5_engine = None
+        while True:
+            text = self._tts_queue.get()
+            if text is None:
+                break
+            voice_id = self._cfg.get('tts_voice', DEFAULT_VOICE)
             try:
-                engine = pyttsx3.init()
-                engine.setProperty('rate', 175)
-                engine.say(text)
-                engine.runAndWait()
+                if voice_id == 'sapi5' or not EDGE_TTS_AVAILABLE:
+                    # SAPI5 fallback — one persistent engine instance
+                    if sapi5_engine is None and TTS_AVAILABLE:
+                        sapi5_engine = pyttsx3.init()
+                        sapi5_engine.setProperty('rate', 175)
+                    if sapi5_engine:
+                        sapi5_engine.say(text)
+                        sapi5_engine.runAndWait()
+                else:
+                    # edge-tts neural voice — save to temp MP3, play via pygame
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+                    tmp.close()
+                    asyncio.run(self._edge_tts_save(text, voice_id, tmp.name))
+                    if PYGAME_AVAILABLE:
+                        if not pygame.mixer.get_init():
+                            pygame.mixer.init()
+                        pygame.mixer.music.load(tmp.name)
+                        pygame.mixer.music.play()
+                        while pygame.mixer.music.get_busy():
+                            time.sleep(0.05)
+                        pygame.mixer.music.unload()
+                    try:
+                        os.remove(tmp.name)
+                    except Exception:
+                        pass
             except Exception as e:
                 self.log(f'TTS error: {e}')
-        threading.Thread(target=_do, daemon=True).start()
+
+    @staticmethod
+    async def _edge_tts_save(text: str, voice: str, path: str):
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(path)
 
     # ── Status helpers ────────────────────────────────────────────────────────
 

@@ -6,3 +6,4 @@ pynput>=1.7.6
 pygame>=2.5.0
 requests>=2.31.0
 pyirsdk
+edge-tts>=6.1.9
