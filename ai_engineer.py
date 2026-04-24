@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.0.6"
+VERSION     = "1.0.7"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages before anything else ──────────────────────
@@ -113,9 +113,32 @@ DIM    = '#6e85b0'
 # ---------------------------------------------------------------------------
 # Config persistence  (AppData)
 # ---------------------------------------------------------------------------
-APPDATA_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'AIRaceEngineer')
-CONFIG_PATH = os.path.join(APPDATA_DIR, 'config.json')
-PLAN_PATH   = os.path.join(APPDATA_DIR, 'race_plan.json')
+APPDATA_DIR  = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'AIRaceEngineer')
+CONFIG_PATH  = os.path.join(APPDATA_DIR, 'config.json')
+PLAN_PATH    = os.path.join(APPDATA_DIR, 'race_plan.json')
+SESSIONS_DIR = os.path.join(APPDATA_DIR, 'sessions')
+
+PERSONALITIES = {
+    'Professional Engineer': 'professional',
+    'Intense & Aggressive':  'aggressive',
+    'Friendly Coach':        'friendly',
+}
+
+PERSONALITY_PROMPTS = {
+    'professional': (
+        "You are a calm, precise, data-driven race engineer. Speak like a real F1 engineer — "
+        "concise, factual, no fluff. Use numbers. 1-3 sentences unless detail is requested."
+    ),
+    'aggressive': (
+        "You are an intense, fired-up race engineer. Direct, urgent, passionate. Push the driver "
+        "hard. Short punchy sentences. 1-3 sentences unless detail is requested."
+    ),
+    'friendly': (
+        "You are an encouraging, friendly race coach. Positive, supportive, motivational. "
+        "Warm but still data-driven. 1-3 sentences unless detail is requested."
+    ),
+}
+DEFAULT_PERSONALITY = 'professional'
 
 EDGE_VOICES = {
     'en-US-AriaNeural    (US Female)':    'en-US-AriaNeural',
@@ -137,10 +160,12 @@ DEFAULTS = {
     'ptt_binding':       {'type': 'keyboard', 'key': 'space'},
     'spotter_enabled':   True,
     'tts_voice':         DEFAULT_VOICE,
+    'personality':       DEFAULT_PERSONALITY,
 }
 
 # Create AppData directory on startup if it doesn't exist
 os.makedirs(APPDATA_DIR, exist_ok=True)
+os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 
 def _binding_label(binding: dict) -> str:
@@ -390,6 +415,13 @@ class TelemetryThread(threading.Thread):
                 lap_last      = ir['LapLastLapTime']   or 0.0
                 lap_completed = ir['LapCompleted']     or 0
 
+                # Opponent data
+                car_idx_positions = ir['CarIdxPosition']   or []
+                car_idx_f2time    = ir['CarIdxF2Time']      or []
+                car_idx_lap_pct   = ir['CarIdxLapDistPct']  or []
+                my_car_idx        = ir['PlayerCarIdx']       or 0
+                driver_info       = ir['DriverInfo']         or {}
+
                 # Convert fuel to litres if the plan uses litres
                 fuel = fuel_raw * 3.78541 if fuel_unit == 'l' else fuel_raw
 
@@ -409,8 +441,37 @@ class TelemetryThread(threading.Thread):
                         # Update auto-detected plan's FPL once we have 3+ laps of data
                         if len(fuel_history) >= 3 and self._app._plan.get('auto_detected'):
                             self._app.after(0, lambda f=avg_fpl: self._app._update_auto_fpl(f))
+                    # Also fire lap coaching
+                    if lap_last > 0:
+                        _fpl_for_coach = actual_fpl if (0.05 < actual_fpl < 5.0) else None
+                        self._app.after(0, lambda lt=lap_last, lc=lap_completed, fp=_fpl_for_coach:
+                            self._app._on_lap_complete(lc, lt, fp))
                     last_fpl_lap = lap_completed
                 prev_fuel = fuel
+
+                # Build opponents dict
+                opponents = {}
+                try:
+                    my_pos   = car_idx_positions[my_car_idx] if my_car_idx < len(car_idx_positions) else 0
+                    drivers  = driver_info.get('Drivers', []) or []
+                    idx_map  = {d.get('CarIdx', -1): d.get('UserName', '?') for d in drivers}
+
+                    def _find_car_at_pos(pos):
+                        for idx, p in enumerate(car_idx_positions):
+                            if p == pos and idx != my_car_idx:
+                                gap = car_idx_f2time[idx] if idx < len(car_idx_f2time) else 0.0
+                                return {'position': pos, 'name': idx_map.get(idx, '?'), 'gap': abs(gap or 0.0)}
+                        return None
+
+                    if my_pos > 1:
+                        ahead = _find_car_at_pos(my_pos - 1)
+                        if ahead:
+                            opponents['ahead'] = ahead
+                    behind = _find_car_at_pos(my_pos + 1)
+                    if behind:
+                        opponents['behind'] = behind
+                except Exception:
+                    pass
 
                 live = _calc_live_status(current_lap, stints, plan) if stints else {}
 
@@ -428,6 +489,7 @@ class TelemetryThread(threading.Thread):
                         'last_lap_time_s': round(lap_last, 3) if lap_last > 0 else None,
                         'session_time_s':  round(session_time, 1),
                         'fuel_delta':      fuel_delta,
+                        'opponents':       opponents,
                         'stale':           False,
                     },
                 }
@@ -552,6 +614,12 @@ class App(tk.Tk):
         self._queries_today      = 0
         self._query_limit        = 50
         self._display_name       = self._cfg.get('display_name', '')
+        self._convo_history: list = []
+        self._session_notes: list = []
+        self._session_memory_summary: str = ''
+        self._session_best_lap: float = 0.0
+        self._lap_times_this_session: list = []
+        self._last_coached_lap: int = 0
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -599,6 +667,12 @@ class App(tk.Tk):
         voice_label = next((k for k, v in EDGE_VOICES.items() if v == saved_voice),
                            list(EDGE_VOICES.keys())[0])
         self.v_voice = tk.StringVar(value=voice_label)
+        saved_personality = self._cfg.get('personality', DEFAULT_PERSONALITY)
+        personality_label = next(
+            (k for k, v in PERSONALITIES.items() if v == saved_personality),
+            list(PERSONALITIES.keys())[0],
+        )
+        self.v_personality = tk.StringVar(value=personality_label)
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue()
@@ -676,16 +750,24 @@ class App(tk.Tk):
                           state='readonly', width=6)
         cb.grid(row=4, column=1, sticky='w', pady=3)
 
-        # Row 5: Voice
-        ttk.Label(frm, text='Voice').grid(row=5, column=0, sticky='w', pady=3, padx=(0, 10))
+        # Row 5: Personality
+        ttk.Label(frm, text='Personality').grid(row=5, column=0, sticky='w', pady=3, padx=(0, 10))
+        personality_cb = ttk.Combobox(frm, textvariable=self.v_personality,
+                                       values=list(PERSONALITIES.keys()),
+                                       state='readonly', width=22)
+        personality_cb.grid(row=5, column=1, sticky='w', pady=3)
+        personality_cb.bind('<<ComboboxSelected>>', lambda _: self._save_personality_pref())
+
+        # Row 6: Voice
+        ttk.Label(frm, text='Voice').grid(row=6, column=0, sticky='w', pady=3, padx=(0, 10))
         voice_cb = ttk.Combobox(frm, textvariable=self.v_voice,
                                 values=list(EDGE_VOICES.keys()),
                                 state='readonly', width=32)
-        voice_cb.grid(row=5, column=1, sticky='ew', pady=3, columnspan=2)
+        voice_cb.grid(row=6, column=1, sticky='ew', pady=3, columnspan=2)
         voice_cb.bind('<<ComboboxSelected>>', lambda _: self._save_voice_pref())
 
-        # Row 6: Spotter
-        ttk.Label(frm, text='Spotter').grid(row=6, column=0, sticky='w', pady=3, padx=(0, 10))
+        # Row 7: Spotter
+        ttk.Label(frm, text='Spotter').grid(row=7, column=0, sticky='w', pady=3, padx=(0, 10))
         tk.Checkbutton(
             frm, text='Enable spotter callouts',
             variable=self.v_spotter,
@@ -693,7 +775,7 @@ class App(tk.Tk):
             activebackground=BG2, activeforeground=TEXT,
             font=('Segoe UI', 9),
             command=self._save_spotter_pref,
-        ).grid(row=6, column=1, sticky='w', pady=3, columnspan=2)
+        ).grid(row=7, column=1, sticky='w', pady=3, columnspan=2)
 
     def _save_spotter_pref(self):
         self._cfg['spotter_enabled'] = self.v_spotter.get()
@@ -702,6 +784,11 @@ class App(tk.Tk):
     def _save_voice_pref(self):
         label = self.v_voice.get()
         self._cfg['tts_voice'] = EDGE_VOICES.get(label, DEFAULT_VOICE)
+        save_config(self._cfg)
+
+    def _save_personality_pref(self):
+        label = self.v_personality.get()
+        self._cfg['personality'] = PERSONALITIES.get(label, DEFAULT_PERSONALITY)
         save_config(self._cfg)
 
     def _check_for_update(self):
@@ -1089,6 +1176,8 @@ class App(tk.Tk):
         else:
             # Plan missing — open wizard at plan step
             self._show_wizard(start_at_plan=True)
+
+        self._load_session_memory()
 
     # ── First-run wizard ─────────────────────────────────────────────────────
 
@@ -1483,6 +1572,78 @@ class App(tk.Tk):
                    command=save_plan).pack(fill='x', pady=(4, 0))
         ttk.Button(outer, text='Cancel', style='WizardSec.TButton',
                    command=dlg.destroy).pack(fill='x', pady=(4, 0))
+
+    # ── Session memory ────────────────────────────────────────────────────────
+
+    def _load_session_memory(self):
+        try:
+            files = [
+                os.path.join(SESSIONS_DIR, f)
+                for f in os.listdir(SESSIONS_DIR)
+                if f.endswith('.json')
+            ]
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            recent = files[:3]
+            if not recent:
+                return
+            lines = ['PAST SESSIONS (most recent first):']
+            for fp in recent:
+                try:
+                    with open(fp) as f:
+                        s = json.load(f)
+                    date   = s.get('date', '?')[:10]
+                    track  = s.get('track', '?')
+                    best   = s.get('best_lap', '?')
+                    fpl    = s.get('avg_fpl', '?')
+                    stints = s.get('stints_completed', '?')
+                    notes  = s.get('notes', [])
+                    note_str = '; '.join(notes[-2:]) if notes else ''
+                    lines.append(
+                        f"- {date} | {track} | Best lap: {best} | "
+                        f"Avg FPL: {fpl}L | {stints} stints"
+                        + (f' | Notes: {note_str}' if note_str else '')
+                    )
+                except Exception:
+                    pass
+            self._session_memory_summary = '\n'.join(lines)
+        except Exception:
+            pass
+
+    def _save_session_memory(self):
+        try:
+            track = self._plan.get('name', 'unknown') if self._plan else 'unknown'
+            track_slug = ''.join(c if c.isalnum() else '_' for c in track)[:40]
+            date_str = time.strftime('%Y-%m-%d')
+            best = f'{self._session_best_lap:.3f}s' if self._session_best_lap > 0 else '?'
+            fd = {}
+            with self._ctx_lock:
+                ctx = self._ctx
+            if ctx:
+                fd = ctx.get('telemetry', {}).get('fuel_delta', {})
+            avg_fpl = round(fd.get('avg_actual_fpl', 0), 3) if fd.get('avg_actual_fpl') else '?'
+            stints_done = 0
+            if ctx:
+                live = ctx.get('live', {})
+                cs   = live.get('current_stint', {})
+                stints_done = cs.get('stint_num', 0) or 0
+            data = {
+                'date':             date_str,
+                'track':            track,
+                'best_lap':         best,
+                'avg_fpl':          avg_fpl,
+                'stints_completed': stints_done,
+                'notes':            self._session_notes[-5:],
+            }
+            fname = f'{date_str}_{track_slug}.json'
+            with open(os.path.join(SESSIONS_DIR, fname), 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def _add_session_note(self, note: str):
+        self._session_notes.append(note)
+        if len(self._session_notes) > 20:
+            self._session_notes = self._session_notes[-20:]
 
     # ── Engineer control ─────────────────────────────────────────────────────
 
@@ -1908,10 +2069,17 @@ class App(tk.Tk):
         with self._ctx_lock:
             ctx = self._ctx
         system_prompt = self._build_system_prompt(ctx) if ctx else ''
+        self._convo_history.append({'role': 'user', 'content': question})
+        messages = self._convo_history[-6:]
         try:
             r = requests.post(
                 f'{BACKEND_URL}/engineer/ask',
-                json={'token': token, 'system_prompt': system_prompt, 'question': question},
+                json={
+                    'token':         token,
+                    'system_prompt': system_prompt,
+                    'question':      question,
+                    'messages':      messages,
+                },
                 timeout=15,
             )
             data = r.json()
@@ -1926,6 +2094,9 @@ class App(tk.Tk):
             remaining = data.get('query_limit', 50) - data.get('queries_today', 0)
             self._queries_today = data.get('queries_today', self._queries_today)
             self._query_limit   = data.get('query_limit', self._query_limit)
+            self._convo_history.append({'role': 'assistant', 'content': answer})
+            if len(self._convo_history) > 20:
+                self._convo_history = self._convo_history[-20:]
             self.log(f'Engineer: {answer}')
             self.log(f'  ({remaining} queries remaining today)')
             self.after(0, lambda: self.v_queries.set(
@@ -1944,6 +2115,9 @@ class App(tk.Tk):
         cs = live.get('current_stint', {})
         ns = live.get('next_stint', {})
 
+        personality_key = self._cfg.get('personality', DEFAULT_PERSONALITY)
+        persona_line    = PERSONALITY_PROMPTS.get(personality_key, PERSONALITY_PROMPTS[DEFAULT_PERSONALITY])
+
         def safe_float(v, fmt='.1f'):
             try:
                 return format(float(v), fmt)
@@ -1951,9 +2125,15 @@ class App(tk.Tk):
                 return str(v) if v is not None else '?'
 
         lines = [
-            "You are a professional endurance racing engineer. Answer concisely — "
-            "1-3 sentences maximum unless asked for detail. Be direct and specific with numbers.",
+            persona_line,
             "",
+        ]
+
+        if self._session_memory_summary:
+            lines.append(self._session_memory_summary)
+            lines.append("")
+
+        lines += [
             f"RACE: {plan.get('name', 'Unknown')} | Duration: {plan.get('race_duration_hrs', '?')}h",
             f"LAP: {live.get('current_lap', '?')} | DRIVER: {cs.get('driver_name', '?')} "
             f"| STINT: {cs.get('stint_num', '?')} of {plan.get('total_stints', '?')}",
@@ -1977,6 +2157,22 @@ class App(tk.Tk):
                 f"FUEL DELTA: actual {fd['avg_actual_fpl']:.3f}L/lap vs planned {planned_fpl}L/lap"
             )
 
+        opponents = tele.get('opponents', {})
+        if opponents:
+            ahead   = opponents.get('ahead')
+            behind  = opponents.get('behind')
+            opp_parts = []
+            if ahead:
+                opp_parts.append(
+                    f"P{ahead['position']} {ahead['name']} +{ahead['gap']:.1f}s ahead"
+                )
+            if behind:
+                opp_parts.append(
+                    f"P{behind['position']} {behind['name']} +{behind['gap']:.1f}s behind"
+                )
+            if opp_parts:
+                lines.append(f"OPPONENTS: {' | '.join(opp_parts)}")
+
         lines.append("")
         lines.append("STINT PLAN SUMMARY:")
         for s in plan.get('stints', [])[:plan.get('total_stints', 99)]:
@@ -1988,6 +2184,84 @@ class App(tk.Tk):
             )
 
         return "\n".join(lines)
+
+    # ── Proactive lap coaching ────────────────────────────────────────────────
+
+    def _on_lap_complete(self, lap_num: int, lap_time: float, fpl):
+        if lap_num <= self._last_coached_lap:
+            return
+        if lap_num < 2:
+            self._last_coached_lap = lap_num
+            return
+        if not self._running:
+            return
+
+        if self._session_best_lap <= 0 or lap_time < self._session_best_lap:
+            self._session_best_lap = lap_time
+
+        self._lap_times_this_session.append(lap_time)
+        if len(self._lap_times_this_session) > 10:
+            self._lap_times_this_session = self._lap_times_this_session[-10:]
+
+        self._last_coached_lap = lap_num
+
+        is_pb = (lap_time == self._session_best_lap and len(self._lap_times_this_session) > 1)
+        recent = self._lap_times_this_session[-5:]
+        avg    = sum(recent) / len(recent) if recent else lap_time
+        is_slow = len(recent) >= 3 and lap_time > avg * 1.03
+        is_check_in = lap_num % 5 == 0
+
+        if not (is_pb or is_slow or is_check_in):
+            return
+
+        if is_pb:
+            reason = 'New session best!'
+        elif is_slow:
+            reason = f'Lap {(lap_time - avg):.1f}s slower than recent average'
+        else:
+            reason = 'Regular check-in'
+
+        threading.Thread(
+            target=self._ask_lap_coaching,
+            args=(lap_num, lap_time, fpl, reason),
+            daemon=True,
+        ).start()
+
+    def _ask_lap_coaching(self, lap_num: int, lap_time: float, fpl, reason: str):
+        recent  = self._lap_times_this_session[-5:]
+        avg     = sum(recent) / len(recent) if recent else lap_time
+        fpl_str = f'FPL: {fpl:.3f}L. ' if fpl is not None else ''
+        question = (
+            f"Lap {lap_num} complete. Time: {lap_time:.3f}s. {fpl_str}{reason}. "
+            f"Session best: {self._session_best_lap:.3f}s. "
+            f"Avg last 5: {avg:.3f}s. Brief coaching observation?"
+        )
+        self._add_session_note(f"Lap {lap_num}: {lap_time:.3f}s ({reason})")
+
+        def _do():
+            token = self._cfg.get('token', '')
+            if not token:
+                return
+            with self._ctx_lock:
+                ctx = self._ctx
+            system_prompt = self._build_system_prompt(ctx) if ctx else ''
+            try:
+                r = requests.post(
+                    f'{BACKEND_URL}/engineer/coaching',
+                    json={'token': token, 'system_prompt': system_prompt,
+                          'question': question},
+                    timeout=12,
+                )
+                if r.ok:
+                    answer = r.json().get('answer', '')
+                    if answer:
+                        self.log(f'[COACHING] {answer}')
+                        self.after(0, lambda: self._append_qa(f'[Auto] {question}', answer))
+                        self.speak(answer)
+            except Exception as e:
+                self.log(f'Coaching error: {e}')
+
+        threading.Thread(target=_do, daemon=True).start()
 
     # ── Q&A display ───────────────────────────────────────────────────────────
 
@@ -2075,6 +2349,8 @@ class App(tk.Tk):
         self.after(0, _append)
 
     def on_close(self):
+        if self._session_best_lap > 0 or self._lap_times_this_session:
+            self._save_session_memory()
         self.stop_engineer()
         self.destroy()
 
