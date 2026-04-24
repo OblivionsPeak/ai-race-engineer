@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.1"
+VERSION     = "1.1.2"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -162,7 +162,11 @@ DEFAULTS = {
     'spotter_enabled':   True,
     'tts_voice':         DEFAULT_VOICE,
     'personality':       DEFAULT_PERSONALITY,
+    'units_system':      'metric',
 }
+
+def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
+def _kpa_to_psi(kpa: float) -> float: return kpa / 6.89476
 
 # Create AppData directory on startup if it doesn't exist
 os.makedirs(APPDATA_DIR, exist_ok=True)
@@ -479,6 +483,29 @@ class TelemetryThread(threading.Thread):
 
                 live = _calc_live_status(current_lap, stints, plan) if stints else {}
 
+                # Tire data — pressures in kPa, temps in °C, wear 0–1 (1 = new)
+                def _ir_float(key):
+                    try:
+                        v = ir[key]
+                        return round(float(v), 2) if v is not None else None
+                    except Exception:
+                        return None
+
+                tires = {}
+                for corner, pkey, tl, tm, tr, wl, wm, wr in [
+                    ('LF', 'LFpressure', 'LFtempCL', 'LFtempCM', 'LFtempCR', 'LFwearL', 'LFwearM', 'LFwearR'),
+                    ('RF', 'RFpressure', 'RFtempCL', 'RFtempCM', 'RFtempCR', 'RFwearL', 'RFwearM', 'RFwearR'),
+                    ('LR', 'LRpressure', 'LRtempCL', 'LRtempCM', 'LRtempCR', 'LRwearL', 'LRwearM', 'LRwearR'),
+                    ('RR', 'RRpressure', 'RRtempCL', 'RRtempCM', 'RRtempCR', 'RRwearL', 'RRwearM', 'RRwearR'),
+                ]:
+                    tires[corner] = {
+                        'pressure_kpa': _ir_float(pkey),
+                        'temp_inner_c': _ir_float(tl),
+                        'temp_mid_c':   _ir_float(tm),
+                        'temp_outer_c': _ir_float(tr),
+                        'wear_pct':     round(_ir_float(wl) * 100, 1) if _ir_float(wl) is not None else None,
+                    }
+
                 ctx = {
                     'plan': {
                         **plan,
@@ -494,6 +521,7 @@ class TelemetryThread(threading.Thread):
                         'session_time_s':  round(session_time, 1),
                         'fuel_delta':      fuel_delta,
                         'opponents':       opponents,
+                        'tires':           tires,
                         'stale':           False,
                     },
                 }
@@ -680,6 +708,7 @@ class App(tk.Tk):
         )
         self.v_personality = tk.StringVar(value=personality_label)
         self.v_volume = tk.DoubleVar(value=self._cfg.get('tts_volume', 1.0))
+        self.v_units  = tk.StringVar(value=self._cfg.get('units_system', 'metric'))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue()
@@ -799,6 +828,14 @@ class App(tk.Tk):
                                        bg=BG2, fg=TEXT, font=('Segoe UI', 9), width=4)
         self._vol_pct_label.pack(side='left', padx=(6, 0))
 
+        # Row 9: Units
+        ttk.Label(frm, text='Units').grid(row=9, column=0, sticky='w', pady=3, padx=(0, 10))
+        units_cb = ttk.Combobox(frm, textvariable=self.v_units,
+                                values=['metric', 'imperial'],
+                                state='readonly', width=12)
+        units_cb.grid(row=9, column=1, sticky='w', pady=3)
+        units_cb.bind('<<ComboboxSelected>>', lambda _: self._save_units_pref())
+
     def _save_spotter_pref(self):
         self._cfg['spotter_enabled'] = self.v_spotter.get()
         save_config(self._cfg)
@@ -817,6 +854,10 @@ class App(tk.Tk):
         vol = self.v_volume.get()
         self._cfg['tts_volume'] = vol
         self._vol_pct_label.config(text=f'{int(vol * 100)}%')
+        save_config(self._cfg)
+
+    def _save_units_pref(self):
+        self._cfg['units_system'] = self.v_units.get()
         save_config(self._cfg)
 
     def _check_for_update(self):
@@ -2266,11 +2307,24 @@ class App(tk.Tk):
         personality_key = self._cfg.get('personality', DEFAULT_PERSONALITY)
         persona_line    = PERSONALITY_PROMPTS.get(personality_key, PERSONALITY_PROMPTS[DEFAULT_PERSONALITY])
 
+        units   = self._cfg.get('units_system', 'metric')
+        imperial = (units == 'imperial')
+
         def safe_float(v, fmt='.1f'):
             try:
                 return format(float(v), fmt)
             except (TypeError, ValueError):
                 return str(v) if v is not None else '?'
+
+        def fmt_temp(c):
+            if c is None: return '?'
+            v = _c_to_f(c) if imperial else c
+            return f"{v:.0f}{'°F' if imperial else '°C'}"
+
+        def fmt_pres(kpa):
+            if kpa is None: return '?'
+            v = _kpa_to_psi(kpa) if imperial else kpa
+            return f"{v:.1f}{'psi' if imperial else 'kPa'}"
 
         lines = [
             persona_line,
@@ -2321,6 +2375,21 @@ class App(tk.Tk):
             if opp_parts:
                 lines.append(f"OPPONENTS: {' | '.join(opp_parts)}")
 
+        tires = tele.get('tires', {})
+        if tires:
+            tire_lines = ["TIRES (hot):"]
+            for corner in ('LF', 'RF', 'LR', 'RR'):
+                t = tires.get(corner, {})
+                pres = fmt_pres(t.get('pressure_kpa'))
+                ti   = fmt_temp(t.get('temp_inner_c'))
+                tm   = fmt_temp(t.get('temp_mid_c'))
+                to_  = fmt_temp(t.get('temp_outer_c'))
+                wear = f"{t['wear_pct']:.0f}%" if t.get('wear_pct') is not None else '?'
+                tire_lines.append(
+                    f"  {corner}: {pres} | temps {ti}/{tm}/{to_} (inner/mid/outer) | wear {wear}"
+                )
+            lines += tire_lines
+
         lines.append("")
         lines.append("STINT PLAN SUMMARY:")
         for s in plan.get('stints', [])[:plan.get('total_stints', 99)]:
@@ -2330,6 +2399,10 @@ class App(tk.Tk):
                 f"{marker}Stint {s['stint_num']}: {s.get('driver_name', '?')} "
                 f"laps {s['start_lap']}-{s['end_lap']} ({pit_str}) {s['fuel_load']}L"
             )
+
+        temp_unit = '°F' if imperial else '°C'
+        pres_unit = 'psi' if imperial else 'kPa'
+        lines.append(f"\nUNITS: Always express temperatures in {temp_unit} and pressures in {pres_unit}.")
 
         return "\n".join(lines)
 
