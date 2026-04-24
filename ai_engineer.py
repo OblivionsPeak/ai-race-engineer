@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.0.5"
+VERSION     = "1.0.6"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages before anything else ──────────────────────
@@ -486,16 +486,24 @@ def _check_update_available() -> tuple[str, str] | None:
 def _apply_update(new_exe_path: str):
     """
     Replace the running EXE with new_exe_path using a .bat trampoline,
-    then exit. Works around Windows locking the running EXE.
+    then exit. Waits for the current PID to fully exit before moving,
+    which prevents the 'Failed to load Python DLL' race condition.
     """
     current_exe = sys.executable if getattr(sys, 'frozen', False) else None
     if not current_exe:
         return  # running as a .py script — skip
 
+    pid      = os.getpid()
     bat_path = os.path.join(tempfile.gettempdir(), '_aire_update.bat')
     bat = (
         '@echo off\n'
-        'timeout /t 2 /nobreak >nul\n'
+        # Poll until the old PID is gone (checks every 500 ms, up to 30 s)
+        f':wait\n'
+        f'tasklist /fi "pid eq {pid}" 2>nul | find "{pid}" >nul\n'
+        f'if not errorlevel 1 (\n'
+        f'    timeout /t 1 /nobreak >nul\n'
+        f'    goto wait\n'
+        f')\n'
         f'move /y "{new_exe_path}" "{current_exe}"\n'
         f'start "" "{current_exe}"\n'
         'del "%~f0"\n'
@@ -1039,10 +1047,17 @@ class App(tk.Tk):
                 json={'token': token},
                 timeout=8,
             )
-            if r.ok:
-                data = self._cfg.get('display_name', '')
+            if r.status_code == 401:
+                # Explicitly invalid token — force re-login
+                self.log('Session expired — please log in again.')
+                self._cfg['token'] = ''
+                save_config(self._cfg)
+                self._show_wizard()
+                return
+            elif r.ok:
                 resp = r.json()
-                self._display_name = resp.get('display_name', data)
+                self._display_name  = resp.get('display_name',
+                                               self._cfg.get('display_name', ''))
                 self._queries_today = resp.get('queries_today', 0)
                 self._query_limit   = resp.get('query_limit', 50)
                 self._cfg['display_name'] = self._display_name
@@ -1054,13 +1069,10 @@ class App(tk.Tk):
                     f'({remaining} remaining)'
                 )
             else:
-                self.log('Session expired — please log in again.')
-                self._cfg['token'] = ''
-                save_config(self._cfg)
-                self._show_wizard()
-                return
+                # Server error or unexpected — proceed with cached credentials
+                self.v_acct_label.set(self._cfg.get('display_name', 'Logged in (offline)'))
         except Exception:
-            # Offline / server unreachable — proceed with cached token
+            # Network unreachable — proceed with cached token
             self.v_acct_label.set(self._cfg.get('display_name', 'Logged in (offline)'))
 
         # Load plan if it exists
