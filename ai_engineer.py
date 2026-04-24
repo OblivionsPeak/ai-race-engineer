@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.5"
+VERSION     = "1.1.6"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -600,6 +600,7 @@ def _apply_update(new_exe_path: str):
         f'    goto wait\n'
         f')\n'
         f'move /y "{new_exe_path}" "{current_exe}"\n'
+        f'timeout /t 4 /nobreak >nul\n'
         f'start "" "{current_exe}"\n'
         'del "%~f0"\n'
     )
@@ -976,13 +977,18 @@ class App(tk.Tk):
 
             def download():
                 try:
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.exe')
-                    tmp.close()
+                    # Download into the same folder as the running EXE so Defender
+                    # doesn't flag it as a suspicious file arriving in %TEMP%
+                    if getattr(sys, 'frozen', False):
+                        dl_dir = os.path.dirname(sys.executable)
+                    else:
+                        dl_dir = tempfile.gettempdir()
+                    tmp_path = os.path.join(dl_dir, f'_nrp_update_{os.getpid()}.exe')
                     with requests.get(exe_url, stream=True, timeout=120) as resp:
                         resp.raise_for_status()
                         total = int(resp.headers.get('content-length', 0))
                         done  = 0
-                        with open(tmp.name, 'wb') as f:
+                        with open(tmp_path, 'wb') as f:
                             for chunk in resp.iter_content(chunk_size=65536):
                                 if chunk:
                                     f.write(chunk)
@@ -991,7 +997,7 @@ class App(tk.Tk):
                                         pct = done / total * 100
                                         self.after(0, lambda p=pct: progress_var.set(p))
                     self.after(0, lambda: status_var.set('Installing…'))
-                    self.after(500, lambda: _apply_update(tmp.name))
+                    self.after(500, lambda: _apply_update(tmp_path))
                 except Exception as e:
                     self.after(0, lambda err=e: (
                         status_var.set(f'Download failed: {err}'),
