@@ -8,15 +8,16 @@ echo   OpMo eSports
 echo ============================================
 echo.
 
-where python >nul 2>&1
+set PYTHON=py -3.12
+%PYTHON% --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo ERROR: Python not found.
+    echo ERROR: Python 3.12 not found. Install it from python.org.
     pause & exit /b 1
 )
 
 echo [1/3] Installing build dependencies...
-python -m pip install pyinstaller -q
-python -m pip install -r requirements_engineer.txt -q
+%PYTHON% -m pip install pyinstaller -q
+%PYTHON% -m pip install -r requirements_engineer.txt -q
 echo Done.
 echo.
 
@@ -27,7 +28,7 @@ echo Done.
 echo.
 
 echo [3/3] Building EXE (this takes 2-5 minutes)...
-python -m PyInstaller engineer.spec --noconfirm
+%PYTHON% -m PyInstaller engineer.spec --noconfirm
 echo.
 
 if exist dist\AIRaceEngineer.exe (
