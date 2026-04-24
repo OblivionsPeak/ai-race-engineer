@@ -18,6 +18,9 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
+VERSION     = "1.0.3"
+GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
+
 # ── Auto-install missing packages before anything else ──────────────────────
 def _ensure(package, import_name=None):
     import_name = import_name or package
@@ -421,6 +424,71 @@ class TelemetryThread(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# Auto-updater
+# ---------------------------------------------------------------------------
+def _parse_version(tag: str) -> tuple:
+    """Convert 'v1.2.3' or '1.2.3' to (1, 2, 3) for comparison."""
+    return tuple(int(x) for x in tag.lstrip('v').split('.') if x.isdigit())
+
+
+def _check_update_available() -> tuple[str, str] | None:
+    """
+    Query GitHub Releases API. Returns (tag, download_url) if a newer version
+    exists, or None if up-to-date or the check fails.
+    """
+    try:
+        r = requests.get(
+            f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest',
+            headers={'Accept': 'application/vnd.github+json'},
+            timeout=8,
+        )
+        if not r.ok:
+            return None
+        data     = r.json()
+        tag      = data.get('tag_name', '')
+        assets   = data.get('assets', [])
+        exe_url  = next(
+            (a['browser_download_url'] for a in assets
+             if a['name'].endswith('.exe')),
+            None,
+        )
+        if not tag or not exe_url:
+            return None
+        if _parse_version(tag) > _parse_version(VERSION):
+            return tag, exe_url
+    except Exception:
+        pass
+    return None
+
+
+def _apply_update(new_exe_path: str):
+    """
+    Replace the running EXE with new_exe_path using a .bat trampoline,
+    then exit. Works around Windows locking the running EXE.
+    """
+    current_exe = sys.executable if getattr(sys, 'frozen', False) else None
+    if not current_exe:
+        return  # running as a .py script — skip
+
+    bat_path = os.path.join(tempfile.gettempdir(), '_aire_update.bat')
+    bat = (
+        '@echo off\n'
+        'timeout /t 2 /nobreak >nul\n'
+        f'move /y "{new_exe_path}" "{current_exe}"\n'
+        f'start "" "{current_exe}"\n'
+        'del "%~f0"\n'
+    )
+    with open(bat_path, 'w') as f:
+        f.write(bat)
+    subprocess.Popen(
+        ['cmd', '/c', bat_path],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        close_fds=True,
+    )
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
 class App(tk.Tk):
@@ -511,6 +579,11 @@ class App(tk.Tk):
         # ── Auth check on boot ────────────────────────────────────────────
         self.after(100, self._check_auth_on_boot)
 
+        # ── Update check (background, 3 s delay so UI is ready first) ────
+        if getattr(sys, 'frozen', False):
+            self.after(3000, lambda: threading.Thread(
+                target=self._check_for_update, daemon=True).start())
+
     # ── UI builders ──────────────────────────────────────────────────────────
 
     def _build_header(self):
@@ -577,6 +650,77 @@ class App(tk.Tk):
     def _save_spotter_pref(self):
         self._cfg['spotter_enabled'] = self.v_spotter.get()
         save_config(self._cfg)
+
+    def _check_for_update(self):
+        """Run in a background thread. Prompts user if a newer release exists."""
+        result = _check_update_available()
+        if not result:
+            return
+        tag, exe_url = result
+        self.after(0, lambda: self._prompt_update(tag, exe_url))
+
+    def _prompt_update(self, tag: str, exe_url: str):
+        """Show update dialog on the main thread."""
+        dlg = tk.Toplevel(self)
+        dlg.title('Update Available')
+        dlg.configure(bg=BG)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.geometry('380x200')
+
+        tk.Label(dlg, text='Update Available', bg=BG, fg=TEXT,
+                 font=('Segoe UI', 13, 'bold')).pack(pady=(22, 4))
+        tk.Label(dlg, text=f'Version {tag} is ready.  You have v{VERSION}.',
+                 bg=BG, fg=DIM, font=('Segoe UI', 9)).pack()
+        tk.Label(dlg, text='The app will restart automatically after downloading.',
+                 bg=BG, fg=DIM, font=('Segoe UI', 9)).pack(pady=(2, 14))
+
+        progress_var = tk.DoubleVar(value=0)
+        bar = ttk.Progressbar(dlg, variable=progress_var, maximum=100, length=300)
+        bar.pack(pady=(0, 8))
+
+        status_var = tk.StringVar(value='')
+        tk.Label(dlg, textvariable=status_var, bg=BG, fg=YELLOW,
+                 font=('Segoe UI', 9)).pack()
+
+        btn_frame = tk.Frame(dlg, bg=BG)
+        btn_frame.pack(pady=10)
+        install_btn = ttk.Button(btn_frame, text='Install Now', style='Wizard.TButton')
+        install_btn.pack(side='left', padx=(0, 8))
+        ttk.Button(btn_frame, text='Not Now', style='WizardSec.TButton',
+                   command=dlg.destroy).pack(side='left')
+
+        def do_install():
+            install_btn.config(state='disabled')
+            status_var.set('Downloading…')
+
+            def download():
+                try:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.exe')
+                    tmp.close()
+                    with requests.get(exe_url, stream=True, timeout=120) as resp:
+                        resp.raise_for_status()
+                        total = int(resp.headers.get('content-length', 0))
+                        done  = 0
+                        with open(tmp.name, 'wb') as f:
+                            for chunk in resp.iter_content(chunk_size=65536):
+                                if chunk:
+                                    f.write(chunk)
+                                    done += len(chunk)
+                                    if total:
+                                        pct = done / total * 100
+                                        self.after(0, lambda p=pct: progress_var.set(p))
+                    self.after(0, lambda: status_var.set('Installing…'))
+                    self.after(500, lambda: _apply_update(tmp.name))
+                except Exception as e:
+                    self.after(0, lambda err=e: (
+                        status_var.set(f'Download failed: {err}'),
+                        install_btn.config(state='normal'),
+                    ))
+
+            threading.Thread(target=download, daemon=True).start()
+
+        install_btn.config(command=do_install)
 
     def _logout(self):
         self._cfg['token']        = ''
