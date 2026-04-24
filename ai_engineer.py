@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.0.9"
+VERSION     = "1.1.0"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -679,6 +679,7 @@ class App(tk.Tk):
             list(PERSONALITIES.keys())[0],
         )
         self.v_personality = tk.StringVar(value=personality_label)
+        self.v_volume = tk.DoubleVar(value=self._cfg.get('tts_volume', 1.0))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue()
@@ -783,6 +784,21 @@ class App(tk.Tk):
             command=self._save_spotter_pref,
         ).grid(row=7, column=1, sticky='w', pady=3, columnspan=2)
 
+        # Row 8: Volume
+        ttk.Label(frm, text='Volume').grid(row=8, column=0, sticky='w', pady=3, padx=(0, 10))
+        vol_frame = ttk.Frame(frm)
+        vol_frame.grid(row=8, column=1, sticky='ew', pady=3, columnspan=2)
+        tk.Scale(
+            vol_frame, variable=self.v_volume,
+            from_=0.0, to=1.0, resolution=0.05, orient='horizontal',
+            bg=BG2, fg=TEXT, troughcolor=BG3, highlightthickness=0,
+            activebackground=ACCENT, length=180, showvalue=False,
+            command=lambda _: self._save_volume_pref(),
+        ).pack(side='left')
+        self._vol_pct_label = tk.Label(vol_frame, text=f'{int(self.v_volume.get()*100)}%',
+                                       bg=BG2, fg=TEXT, font=('Segoe UI', 9), width=4)
+        self._vol_pct_label.pack(side='left', padx=(6, 0))
+
     def _save_spotter_pref(self):
         self._cfg['spotter_enabled'] = self.v_spotter.get()
         save_config(self._cfg)
@@ -795,6 +811,12 @@ class App(tk.Tk):
     def _save_personality_pref(self):
         label = self.v_personality.get()
         self._cfg['personality'] = PERSONALITIES.get(label, DEFAULT_PERSONALITY)
+        save_config(self._cfg)
+
+    def _save_volume_pref(self):
+        vol = self.v_volume.get()
+        self._cfg['tts_volume'] = vol
+        self._vol_pct_label.config(text=f'{int(vol * 100)}%')
         save_config(self._cfg)
 
     def _check_for_update(self):
@@ -2313,6 +2335,14 @@ class App(tk.Tk):
 
     # ── Proactive lap coaching ────────────────────────────────────────────────
 
+    @staticmethod
+    def _fmt_lap_spoken(s: float) -> str:
+        m = int(s) // 60
+        sec = s - m * 60
+        if m > 0:
+            return f"{m} minute{'s' if m != 1 else ''} {sec:.1f} seconds"
+        return f"{sec:.1f} seconds"
+
     def _on_lap_complete(self, lap_num: int, lap_time: float, fpl):
         if lap_num <= self._last_coached_lap:
             return
@@ -2353,6 +2383,15 @@ class App(tk.Tk):
         else:
             reason = 'Regular check-in'
 
+        # Speak the lap time immediately so the driver hears it without network delay
+        spoken_time = self._fmt_lap_spoken(lap_time)
+        if is_pb:
+            self.speak(f"Lap {lap_num}, {spoken_time}. New session best.")
+        elif is_slow:
+            self.speak(f"Lap {lap_num}, {spoken_time}.")
+        else:
+            self.speak(f"Lap {lap_num} check-in, {spoken_time}.")
+
         threading.Thread(
             target=self._ask_lap_coaching,
             args=(lap_num, lap_time, fpl, reason),
@@ -2364,9 +2403,12 @@ class App(tk.Tk):
         avg     = sum(recent) / len(recent) if recent else lap_time
         fpl_str = f'FPL: {fpl:.3f}L. ' if fpl is not None else ''
         question = (
-            f"Lap {lap_num} complete. Time: {lap_time:.3f}s. {fpl_str}{reason}. "
-            f"Session best: {self._session_best_lap:.3f}s. "
-            f"Avg last 5: {avg:.3f}s. Brief coaching observation?"
+            f"Lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. {fpl_str}{reason}. "
+            f"Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
+            f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
+            f"The lap time was already announced to the driver — give brief coaching only, "
+            f"do not repeat the lap time. Always express times as minutes and seconds (e.g. "
+            f"'1 minute 14 seconds'), never as total seconds."
         )
         self._add_session_note(f"Lap {lap_num}: {lap_time:.3f}s ({reason})")
 
@@ -2420,6 +2462,7 @@ class App(tk.Tk):
             if text is None:
                 break
             voice_id = self._cfg.get('tts_voice', DEFAULT_VOICE)
+            volume   = max(0.0, min(1.0, self._cfg.get('tts_volume', 1.0)))
             try:
                 if voice_id == 'sapi5' or not EDGE_TTS_AVAILABLE:
                     # SAPI5 fallback — one persistent engine instance
@@ -2427,6 +2470,7 @@ class App(tk.Tk):
                         sapi5_engine = pyttsx3.init()
                         sapi5_engine.setProperty('rate', 175)
                     if sapi5_engine:
+                        sapi5_engine.setProperty('volume', volume)
                         sapi5_engine.say(text)
                         sapi5_engine.runAndWait()
                 else:
@@ -2438,6 +2482,7 @@ class App(tk.Tk):
                         if not pygame.mixer.get_init():
                             pygame.mixer.init()
                         pygame.mixer.music.load(tmp.name)
+                        pygame.mixer.music.set_volume(volume)
                         pygame.mixer.music.play()
                         while pygame.mixer.music.get_busy():
                             time.sleep(0.05)
