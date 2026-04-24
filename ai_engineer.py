@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.2"
+VERSION     = "1.1.3"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -2603,6 +2603,14 @@ class App(tk.Tk):
         if self._session_best_lap > 0 or self._lap_times_this_session:
             self._save_session_memory()
         self.stop_engineer()
+        # Quit pygame fully so it releases all DLL handles before PyInstaller
+        # cleans up the _MEI extraction directory — prevents cleanup warning
+        try:
+            if PYGAME_AVAILABLE and pygame.get_init():
+                pygame.mixer.quit()
+                pygame.quit()
+        except Exception:
+            pass
         self.destroy()
 
 
