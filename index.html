@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neural Racing Performance — AI Race Engineer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #050d12;
+      --bg2:     #091820;
+      --bg3:     #0d2430;
+      --border:  #174858;
+      --accent:  #00c8d4;
+      --cyan:    #48f8f8;
+      --green:   #00d890;
+      --yellow:  #f0c040;
+      --text:    #eaf7f9;
+      --dim:     #68b8c4;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Circuit canvas background ── */
+    #circuit-bg {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      pointer-events: none;
+      opacity: 0.35;
+    }
+
+    .content { position: relative; z-index: 1; }
+
+    /* ── Nav ── */
+    nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 40px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(5,13,18,0.85);
+      backdrop-filter: blur(8px);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .nav-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: var(--text);
+      text-transform: uppercase;
+    }
+    .nav-logo .diamond { color: var(--cyan); font-size: 1.3rem; }
+    nav a {
+      color: var(--dim);
+      text-decoration: none;
+      font-size: 0.85rem;
+      transition: color 0.2s;
+    }
+    nav a:hover { color: var(--accent); }
+
+    /* ── Hero ── */
+    .hero {
+      text-align: center;
+      padding: 100px 24px 80px;
+      max-width: 760px;
+      margin: 0 auto;
+    }
+    .hero-badge {
+      display: inline-block;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      color: var(--accent);
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 5px 14px;
+      border-radius: 20px;
+      margin-bottom: 28px;
+    }
+    .hero h1 {
+      font-size: clamp(2rem, 5vw, 3.2rem);
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      line-height: 1.1;
+      margin-bottom: 12px;
+    }
+    .hero h1 span { color: var(--cyan); }
+    .hero .sub {
+      font-size: 1.1rem;
+      color: var(--dim);
+      max-width: 520px;
+      margin: 0 auto 48px;
+      line-height: 1.6;
+    }
+    .btn-download {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--accent);
+      color: #050d12;
+      font-weight: 700;
+      font-size: 1rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 16px 36px;
+      border-radius: 4px;
+      text-decoration: none;
+      transition: background 0.2s, transform 0.15s;
+    }
+    .btn-download:hover { background: var(--cyan); transform: translateY(-2px); }
+    .btn-download svg { flex-shrink: 0; }
+    .dl-note {
+      margin-top: 12px;
+      font-size: 0.8rem;
+      color: var(--dim);
+    }
+
+    /* ── Features ── */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      max-width: 900px;
+      margin: 60px auto;
+      padding: 0 24px;
+    }
+    .feature-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 24px 20px;
+    }
+    .feature-icon { font-size: 1.4rem; margin-bottom: 10px; }
+    .feature-card h3 {
+      font-size: 0.85rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .feature-card p {
+      font-size: 0.88rem;
+      color: var(--dim);
+      line-height: 1.55;
+    }
+
+    /* ── Requirements ── */
+    .requirements {
+      max-width: 560px;
+      margin: 0 auto 80px;
+      padding: 0 24px;
+      text-align: center;
+    }
+    .requirements h2 {
+      font-size: 0.8rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--dim);
+      margin-bottom: 20px;
+    }
+    .req-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+    }
+    .req-pill {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 0.82rem;
+      padding: 6px 14px;
+      border-radius: 20px;
+    }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid var(--border);
+      text-align: center;
+      padding: 24px;
+      font-size: 0.78rem;
+      color: var(--dim);
+    }
+  </style>
+</head>
+<body>
+
+<canvas id="circuit-bg"></canvas>
+
+<div class="content">
+  <nav>
+    <div class="nav-logo">
+      <span class="diamond">◈</span>
+      Neural Racing Performance
+    </div>
+    <a href="https://github.com/OblivionsPeak/ai-race-engineer/releases/latest">Latest Release</a>
+  </nav>
+
+  <section class="hero">
+    <div class="hero-badge">AI Race Engineer · iRacing</div>
+    <h1>Race smarter.<br><span>Every lap.</span></h1>
+    <p class="sub">
+      Live strategy, lap coaching, fuel management and spotter callouts —
+      powered by AI and pulled directly from iRacing telemetry.
+    </p>
+    <a class="btn-download" id="dl-btn"
+       href="https://github.com/OblivionsPeak/ai-race-engineer/releases/latest/download/NeuralRacingPerformance.exe">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      Download for Windows
+    </a>
+    <p class="dl-note">Windows 10/11 · Free to try · Auto-updates automatically</p>
+  </section>
+
+  <section class="features">
+    <div class="feature-card">
+      <div class="feature-icon">🎙️</div>
+      <h3>Push-to-Talk</h3>
+      <p>Ask your engineer anything mid-race using a button or keyboard shortcut. Answers spoken back in real time.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">⛽</div>
+      <h3>Fuel Strategy</h3>
+      <p>Live fuel calculations, pit window predictions, and alerts before you run dry — all from iRacing telemetry.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🏎️</div>
+      <h3>Lap Coaching</h3>
+      <p>Automatic post-lap feedback on personal bests, slow laps, and pace trends without lifting a finger.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🔧</div>
+      <h3>Setup Advice</h3>
+      <p>Hot tyre pressures and temperature spreads fed directly to the AI for camber, balance, and pressure guidance.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">📡</div>
+      <h3>Spotter</h3>
+      <p>Proximity callouts so you always know what's alongside you, powered by live opponent position data.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">👥</div>
+      <h3>Team Racing</h3>
+      <p>Multi-driver stint planning, driver swap tracking, and per-driver fuel loads built in from the start.</p>
+    </div>
+  </section>
+
+  <section class="requirements">
+    <h2>Requirements</h2>
+    <div class="req-list">
+      <span class="req-pill">Windows 10 / 11</span>
+      <span class="req-pill">iRacing subscription</span>
+      <span class="req-pill">Free NRP account</span>
+      <span class="req-pill">Internet connection</span>
+    </div>
+  </section>
+
+  <footer>
+    Neural Racing Performance &nbsp;·&nbsp; AI Race Engineer
+  </footer>
+</div>
+
+<script>
+  // ── Circuit board background canvas ──────────────────────────────────────
+  (function () {
+    const canvas = document.getElementById('circuit-bg');
+    const ctx = canvas.getContext('2d');
+
+    function resize() {
+      canvas.width  = window.innerWidth;
+      canvas.height = window.innerHeight;
+      draw();
+    }
+
+    function draw() {
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const TRACE  = '#0c3040';
+      const TRACE2 = '#164858';
+      const NODE   = '#48f8f8';
+      const PAD    = '#0f3040';
+
+      const step = 48;
+      const cols = Math.ceil(w / step) + 1;
+      const rows = Math.ceil(h / step) + 1;
+
+      // Horizontal lines
+      for (let r = 0; r < rows; r++) {
+        if (r % 3 !== 0) continue;
+        const y = r * step;
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.strokeStyle = r % 6 === 0 ? TRACE2 : TRACE;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+      // Vertical connectors and nodes
+      for (let c = 0; c < cols; c++) {
+        const x = c * step;
+        const bucket = c % 3;
+
+        // Short vertical segment connecting two horizontal rows
+        const r1 = Math.floor(c * 1.7) % rows;
+        const r2 = r1 + 3;
+        if (r2 < rows && r1 % 3 === 0) {
+          ctx.beginPath();
+          ctx.moveTo(x, r1 * step);
+          ctx.lineTo(x, r2 * step);
+          ctx.strokeStyle = bucket === 1 ? TRACE2 : TRACE;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+
+        // Nodes at every 3rd row intersection
+        for (let r = 0; r < rows; r += 3) {
+          const y = r * step;
+          const kind = (c + r) % 5;
+          if (kind === 0) {
+            // Square pad
+            ctx.fillStyle = PAD;
+            ctx.strokeStyle = TRACE2;
+            ctx.lineWidth = 1;
+            ctx.fillRect(x - 3, y - 3, 6, 6);
+            ctx.strokeRect(x - 3, y - 3, 6, 6);
+          } else if (kind === 2) {
+            // Bright via
+            ctx.beginPath();
+            ctx.arc(x, y, 3, 0, Math.PI * 2);
+            ctx.fillStyle = NODE;
+            ctx.fill();
+          }
+        }
+      }
+    }
+
+    window.addEventListener('resize', resize);
+    resize();
+  })();
+
+  // ── Pull latest release tag for the download button ──────────────────────
+  fetch('https://api.github.com/repos/OblivionsPeak/ai-race-engineer/releases/latest')
+    .then(r => r.json())
+    .then(data => {
+      const tag = data.tag_name;
+      const asset = (data.assets || []).find(a => a.name.endsWith('.exe'));
+      if (asset) {
+        document.getElementById('dl-btn').href = asset.browser_download_url;
+      }
+      if (tag) {
+        const note = document.querySelector('.dl-note');
+        note.textContent = `Windows 10/11  ·  ${tag}  ·  Auto-updates automatically`;
+      }
+    })
+    .catch(() => {});
+</script>
+</body>
+</html>
