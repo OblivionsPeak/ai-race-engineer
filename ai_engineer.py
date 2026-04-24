@@ -21,8 +21,10 @@ BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 VERSION     = "1.0.9"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
-# ── Auto-install missing packages before anything else ──────────────────────
+# ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
 def _ensure(package, import_name=None):
+    if getattr(sys, 'frozen', False):
+        return  # running as PyInstaller EXE — packages are already bundled
     import_name = import_name or package
     try:
         __import__(import_name)
@@ -39,7 +41,6 @@ _ensure('scipy')
 _ensure('pynput')
 _ensure('pygame')
 _ensure('edge-tts', 'edge_tts')
-# Note: anthropic and openai are no longer needed client-side
 # ── Now safe to import ───────────────────────────────────────────────────────
 
 import asyncio
