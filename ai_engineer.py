@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.8"
+VERSION     = "1.1.9"
 GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -164,10 +164,10 @@ DEFAULTS = {
     'tts_voice':         DEFAULT_VOICE,
     'personality':       DEFAULT_PERSONALITY,
     'units_system':      'metric',
+    'checkin_laps':      5,
 }
 
 def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
-def _kpa_to_psi(kpa: float) -> float: return kpa / 6.89476
 
 # Create AppData directory on startup if it doesn't exist
 os.makedirs(APPDATA_DIR, exist_ok=True)
@@ -187,9 +187,9 @@ def _binding_label(binding: dict) -> str:
 DEFAULT_RACE_PLAN = {
     'name':              'My Race',
     'race_duration_hrs': 2.5,
-    'fuel_capacity_l':   18.5,
-    'fuel_per_lap_l':    0.92,
-    'lap_time_s':        92.0,
+    'fuel_capacity_l':   50.0,   # replace with your car's actual tank size
+    'fuel_per_lap_l':    2.5,    # replace with your car's measured fuel use
+    'lap_time_s':        120.0,  # replace with your expected lap time
     'pit_loss_s':        35.0,
     'drivers': [
         {'name': 'Driver 1', 'max_hours': 2.5},
@@ -210,8 +210,8 @@ def save_config(cfg: dict):
     try:
         with open(CONFIG_PATH, 'w') as f:
             json.dump(cfg, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'[NRP] Config save failed: {e}', file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -395,11 +395,21 @@ class TelemetryThread(threading.Thread):
         fuel_history       = []
         auto_plan_detected = False
 
+        def _safe(v):
+            try: return round(float(v), 2) if v is not None else None
+            except (TypeError, ValueError): return None
+
         while not self._stop.is_set():
             try:
                 if not ir.is_initialized or not ir.is_connected:
                     self._app.set_status('connecting')
                     auto_plan_detected = False
+                    # Mark existing ctx stale so the AI knows telemetry is unavailable
+                    with self._app._ctx_lock:
+                        if self._app._ctx:
+                            self._app._ctx['telemetry']['stale'] = True
+                        else:
+                            self._app._ctx = None
                     ir.startup()
                     self._stop.wait(2)
                     continue
@@ -413,8 +423,9 @@ class TelemetryThread(threading.Thread):
                         auto_plan_detected = True
                         self._app.after(0, lambda p=auto_plan: self._app._apply_auto_plan(p))
 
-                plan      = self._app._plan
-                stints    = self._app._stints
+                with self._app._ctx_lock:
+                    plan      = self._app._plan
+                    stints    = self._app._stints
                 fuel_unit = self._app._cfg.get('fuel_unit', 'gal')
 
                 current_lap    = ir['Lap']                       or 0
@@ -433,7 +444,6 @@ class TelemetryThread(threading.Thread):
                 # Opponent data
                 car_idx_positions = ir['CarIdxPosition']   or []
                 car_idx_f2time    = ir['CarIdxF2Time']      or []
-                car_idx_lap_pct   = ir['CarIdxLapDistPct']  or []
                 my_car_idx        = ir['PlayerCarIdx']       or 0
                 driver_info       = ir['DriverInfo']         or {}
 
@@ -444,7 +454,7 @@ class TelemetryThread(threading.Thread):
                 fuel_delta = {}
                 if lap_completed > last_fpl_lap and prev_fuel is not None:
                     actual_fpl = round(prev_fuel - fuel, 4)
-                    if 0.05 < actual_fpl < 5.0:
+                    if 0.05 < actual_fpl < 10.0:
                         fuel_history.append(actual_fpl)
                         fuel_history = fuel_history[-10:]
                         avg_fpl = round(sum(fuel_history) / len(fuel_history), 4)
@@ -458,9 +468,10 @@ class TelemetryThread(threading.Thread):
                             self._app.after(0, lambda f=avg_fpl: self._app._update_auto_fpl(f))
                     # Also fire lap coaching
                     if lap_last > 0:
-                        _fpl_for_coach = actual_fpl if (0.05 < actual_fpl < 5.0) else None
-                        self._app.after(0, lambda lt=lap_last, lc=lap_completed, fp=_fpl_for_coach:
-                            self._app._on_lap_complete(lc, lt, fp))
+                        _fpl_for_coach = actual_fpl if (0.05 < actual_fpl < 10.0) else None
+                        self._app.after(0, lambda lt=lap_last, lc=lap_completed,
+                                        fp=_fpl_for_coach, st=session_type:
+                            self._app._on_lap_complete(lc, lt, fp, st))
                     last_fpl_lap = lap_completed
                 prev_fuel = fuel
 
@@ -468,57 +479,34 @@ class TelemetryThread(threading.Thread):
                 opponents = {}
                 my_position = None
                 try:
-                    my_pos   = car_idx_positions[my_car_idx] if my_car_idx < len(car_idx_positions) else 0
+                    my_pos      = car_idx_positions[my_car_idx] if my_car_idx < len(car_idx_positions) else 0
                     my_position = my_pos if my_pos > 0 else None
-                    drivers  = driver_info.get('Drivers', []) or []
-                    idx_map  = {d.get('CarIdx', -1): d.get('UserName', '?') for d in drivers}
+                    drivers     = driver_info.get('Drivers', []) or []
+                    idx_map     = {d.get('CarIdx', -1): d.get('UserName', '?') for d in drivers}
 
-                    def _find_car_at_pos(pos):
-                        for idx, p in enumerate(car_idx_positions):
-                            if p == pos and idx != my_car_idx:
-                                gap = car_idx_f2time[idx] if idx < len(car_idx_f2time) else 0.0
-                                return {'position': pos, 'name': idx_map.get(idx, '?'), 'gap': abs(gap or 0.0)}
+                    def _find_car_at_pos(pos, positions, f2times, excl_idx, names):
+                        for idx, p in enumerate(positions):
+                            if p == pos and idx != excl_idx:
+                                gap = f2times[idx] if idx < len(f2times) else 0.0
+                                return {'position': pos, 'name': names.get(idx, '?'), 'gap': abs(gap or 0.0)}
                         return None
 
                     if my_pos > 1:
-                        ahead = _find_car_at_pos(my_pos - 1)
+                        ahead = _find_car_at_pos(my_pos - 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map)
                         if ahead:
                             opponents['ahead'] = ahead
-                    behind = _find_car_at_pos(my_pos + 1)
+                    behind = _find_car_at_pos(my_pos + 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map)
                     if behind:
                         opponents['behind'] = behind
                     opponents['my_position'] = my_position
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._app.log(f'Opponents parse error: {e}')
 
                 live = _calc_live_status(current_lap, stints, plan) if stints else {}
 
-                # Tire data — pressures in kPa, temps in °C, wear 0–1 (1 = new)
-                def _ir_float(key):
-                    try:
-                        v = ir[key]
-                        return round(float(v), 2) if v is not None else None
-                    except Exception:
-                        return None
-
-                tires = {}
-                for corner, pkey, tl, tm, tr, wl, wm, wr in [
-                    ('LF', 'LFpressure', 'LFtempCL', 'LFtempCM', 'LFtempCR', 'LFwearL', 'LFwearM', 'LFwearR'),
-                    ('RF', 'RFpressure', 'RFtempCL', 'RFtempCM', 'RFtempCR', 'RFwearL', 'RFwearM', 'RFwearR'),
-                    ('LR', 'LRpressure', 'LRtempCL', 'LRtempCM', 'LRtempCR', 'LRwearL', 'LRwearM', 'LRwearR'),
-                    ('RR', 'RRpressure', 'RRtempCL', 'RRtempCM', 'RRtempCR', 'RRwearL', 'RRwearM', 'RRwearR'),
-                ]:
-                    tires[corner] = {
-                        'pressure_kpa': _ir_float(pkey),
-                        'temp_inner_c': _ir_float(tl),
-                        'temp_mid_c':   _ir_float(tm),
-                        'temp_outer_c': _ir_float(tr),
-                        'wear_pct':     round(_ir_float(wl) * 100, 1) if _ir_float(wl) is not None else None,
-                    }
-
                 def _safe(v):
                     try: return round(float(v), 2) if v is not None else None
-                    except: return None
+                    except (TypeError, ValueError): return None
 
                 ctx = {
                     'plan': {
@@ -536,7 +524,6 @@ class TelemetryThread(threading.Thread):
                         'fuel_delta':         fuel_delta,
                         'fuel_laps_measured': len(fuel_history),
                         'opponents':          opponents,
-                        'tires':              tires,
                         'incidents':          incidents,
                         'stale':              False,
                     },
@@ -690,6 +677,7 @@ class App(tk.Tk):
         self._session_best_lap: float = 0.0
         self._lap_times_this_session: list = []
         self._last_coached_lap: int = 0
+        self._coaching_in_flight: bool = False
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -743,11 +731,13 @@ class App(tk.Tk):
             list(PERSONALITIES.keys())[0],
         )
         self.v_personality = tk.StringVar(value=personality_label)
-        self.v_volume = tk.DoubleVar(value=self._cfg.get('tts_volume', 1.0))
-        self.v_units  = tk.StringVar(value=self._cfg.get('units_system', 'metric'))
+        self.v_volume       = tk.DoubleVar(value=self._cfg.get('tts_volume', 1.0))
+        self.v_units        = tk.StringVar(value=self._cfg.get('units_system', 'metric'))
+        _ci_raw = self._cfg.get('checkin_laps', 5)
+        self.v_checkin_laps = tk.StringVar(value='never' if not _ci_raw else str(_ci_raw))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
-        self._tts_queue  = queue.Queue()
+        self._tts_queue  = queue.Queue(maxsize=5)
         self._tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
         self._tts_thread.start()
 
@@ -933,6 +923,15 @@ class App(tk.Tk):
         units_cb.grid(row=9, column=1, sticky='w', pady=3)
         units_cb.bind('<<ComboboxSelected>>', lambda _: self._save_units_pref())
 
+        # Row 10: Coaching check-in frequency
+        ttk.Label(frm, text='Check-in every').grid(row=10, column=0, sticky='w', pady=3, padx=(0, 10))
+        checkin_cb = ttk.Combobox(frm, textvariable=self.v_checkin_laps,
+                                  values=['3', '5', '10', 'never'],
+                                  state='readonly', width=12)
+        checkin_cb.grid(row=10, column=1, sticky='w', pady=3)
+        ttk.Label(frm, text='laps').grid(row=10, column=2, sticky='w', pady=3)
+        checkin_cb.bind('<<ComboboxSelected>>', lambda _: self._save_checkin_pref())
+
     def _save_spotter_pref(self):
         self._cfg['spotter_enabled'] = self.v_spotter.get()
         save_config(self._cfg)
@@ -955,6 +954,11 @@ class App(tk.Tk):
 
     def _save_units_pref(self):
         self._cfg['units_system'] = self.v_units.get()
+        save_config(self._cfg)
+
+    def _save_checkin_pref(self):
+        val = self.v_checkin_laps.get()
+        self._cfg['checkin_laps'] = 0 if val == 'never' else int(val)
         save_config(self._cfg)
 
     def _check_for_update(self):
@@ -1070,11 +1074,8 @@ class App(tk.Tk):
                 f'Est.FPL: {plan["fuel_per_lap_l"]}L (refining…)'
             )
             # Start server session now that we know the track
-            plan_name = plan.get('name', '')
-            parts     = plan_name.split(' · ')
-            track     = parts[0] if parts else plan_name
-            car       = parts[1] if len(parts) > 1 else ''
-            self._start_server_session(track, car)
+            self._start_server_session(plan.get('track', plan.get('name', '')),
+                                       plan.get('car', ''))
         except Exception as e:
             self.log(f'[AUTO] Plan apply error: {e}')
 
@@ -1089,8 +1090,8 @@ class App(tk.Tk):
             self._stints = _calculate_stints(self._plan)
             self._update_plan_display()
             self.log(f'[AUTO] Fuel/lap refined to {avg_fpl}L from telemetry.')
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f'[AUTO] Stint recalculation failed after FPL update: {e}')
 
     def _rebind_ptt(self):
         """Open a modal dialog that captures the next key or joystick button press."""
@@ -1304,42 +1305,7 @@ class App(tk.Tk):
             self._show_wizard()
             return
 
-        # Try a quick token validation ping
-        try:
-            r = requests.post(
-                f'{BACKEND_URL}/engineer/validate',
-                json={'token': token},
-                timeout=8,
-            )
-            if r.status_code == 401:
-                # Explicitly invalid token — force re-login
-                self.log('Session expired — please log in again.')
-                self._cfg['token'] = ''
-                save_config(self._cfg)
-                self._show_wizard()
-                return
-            elif r.ok:
-                resp = r.json()
-                self._display_name  = resp.get('display_name',
-                                               self._cfg.get('display_name', ''))
-                self._queries_today = resp.get('queries_today', 0)
-                self._query_limit   = resp.get('query_limit', 50)
-                self._cfg['display_name'] = self._display_name
-                save_config(self._cfg)
-                self.v_acct_label.set(self._display_name or 'Logged in')
-                remaining = self._query_limit - self._queries_today
-                self.v_queries.set(
-                    f'{self._queries_today} / {self._query_limit} today  '
-                    f'({remaining} remaining)'
-                )
-            else:
-                # Server error or unexpected — proceed with cached credentials
-                self.v_acct_label.set(self._cfg.get('display_name', 'Logged in (offline)'))
-        except Exception:
-            # Network unreachable — proceed with cached token
-            self.v_acct_label.set(self._cfg.get('display_name', 'Logged in (offline)'))
-
-        # Load plan if it exists
+        # Load plan immediately (local disk — no network needed)
         if os.path.exists(PLAN_PATH):
             try:
                 with open(PLAN_PATH) as f:
@@ -1347,21 +1313,62 @@ class App(tk.Tk):
                 self._plan   = plan
                 self._stints = _calculate_stints(plan)
                 self._update_plan_display()
-            except Exception:
+            except Exception as e:
+                self.log(f'Could not load race plan: {e}')
                 self._plan   = {}
                 self._stints = []
         else:
-            # Plan missing — open wizard at plan step
             self._show_wizard(start_at_plan=True)
 
-        self._load_history_from_server()
+        # Token validation runs in a background thread so the UI is never frozen
+        def _validate():
+            try:
+                r = requests.post(
+                    f'{BACKEND_URL}/engineer/validate',
+                    json={'token': token},
+                    timeout=8,
+                )
+                if r.status_code == 401:
+                    self.after(0, lambda: (
+                        self.log('Session expired — please log in again.'),
+                        self._cfg.update({'token': ''}),
+                        save_config(self._cfg),
+                        self._show_wizard(),
+                    ))
+                    return
+                elif r.ok:
+                    resp  = r.json()
+                    dname = resp.get('display_name', self._cfg.get('display_name', ''))
+                    qt    = resp.get('queries_today', 0)
+                    ql    = resp.get('query_limit', 50)
+                    rem   = ql - qt
+                    self._display_name  = dname
+                    self._queries_today = qt
+                    self._query_limit   = ql
+                    self._cfg['display_name'] = dname
+                    save_config(self._cfg)
+                    self.after(0, lambda: (
+                        self.v_acct_label.set(dname or 'Logged in'),
+                        self.v_queries.set(
+                            f'{qt} / {ql} today  ({rem} remaining)'
+                        ),
+                    ))
+                else:
+                    self.after(0, lambda: self.v_acct_label.set(
+                        self._cfg.get('display_name', 'Logged in (offline)')))
+            except Exception:
+                self.after(0, lambda: self.v_acct_label.set(
+                    self._cfg.get('display_name', 'Logged in (offline)')))
+            self._load_history_from_server()
+
+        threading.Thread(target=_validate, daemon=True).start()
 
     # ── First-run wizard ─────────────────────────────────────────────────────
 
     def _show_wizard(self, start_at_plan: bool = False):
         """Modal wizard: account login/register → race plan setup."""
         dlg = tk.Toplevel(self)
-        dlg.title('AI Race Engineer — Setup')
+        dlg.title('Neural Racing Performance — Setup')
         dlg.configure(bg=BG)
         dlg.resizable(False, False)
         dlg.grab_set()
@@ -1379,6 +1386,7 @@ class App(tk.Tk):
         container.pack(fill='both', expand=True, padx=24, pady=20)
 
         def clear():
+            dlg.unbind('<Return>')
             for w in container.winfo_children():
                 w.destroy()
 
@@ -1459,6 +1467,7 @@ class App(tk.Tk):
                         self.after(0, lambda: v_err.set(f'Network error: {e}'))
                 threading.Thread(target=_req, daemon=True).start()
 
+            dlg.bind('<Return>', lambda e: do_register())
             ttk.Button(container, text='Create Account', style='Wizard.TButton',
                        command=do_register).pack(fill='x', pady=(12, 4))
             ttk.Button(container, text='← Back', style='WizardSec.TButton',
@@ -1516,6 +1525,7 @@ class App(tk.Tk):
                         self.after(0, lambda: v_err.set(f'Network error: {e}'))
                 threading.Thread(target=_req, daemon=True).start()
 
+            dlg.bind('<Return>', lambda e: do_login())
             ttk.Button(container, text='Sign In', style='Wizard.TButton',
                        command=do_login).pack(fill='x', pady=(12, 4))
             ttk.Button(container, text='← Back', style='WizardSec.TButton',
@@ -1788,7 +1798,9 @@ class App(tk.Tk):
 
     def _save_session_memory(self):
         try:
-            track = self._plan.get('name', 'unknown') if self._plan else 'unknown'
+            plan_name  = self._plan.get('name', 'unknown') if self._plan else 'unknown'
+            # Use the dedicated 'track' field when available; fall back to splitting the name
+            track      = (self._plan.get('track') or plan_name.split(' · ')[0]) if self._plan else 'unknown'
             track_slug = ''.join(c if c.isalnum() else '_' for c in track)[:40]
             date_str = time.strftime('%Y-%m-%d')
             best = f'{self._session_best_lap:.3f}s' if self._session_best_lap > 0 else '?'
@@ -1981,6 +1993,14 @@ class App(tk.Tk):
         # ── Determine voice availability ──────────────────────────────────
         voice_ok = SD_AVAILABLE and SCIPY_AVAILABLE and PYNPUT_AVAILABLE
 
+        # Reset all per-session state so a stop/restart is clean.
+        self._last_coached_lap       = 0
+        self._session_best_lap       = 0.0
+        self._lap_times_this_session = []
+        self._session_started        = False
+        self._convo_history          = []
+        self._coaching_in_flight     = False   # guard: only one coaching request at a time
+
         self._stop_evt.clear()
         self._running = True
 
@@ -2045,6 +2065,10 @@ class App(tk.Tk):
             self._telemetry_thread.stop()
             self._telemetry_thread = None
 
+        # Clear stale context so queries asked after stopping don't get old data
+        with self._ctx_lock:
+            self._ctx = None
+
         if self._spotter_thread:
             self._spotter_thread.stop()
             self._spotter_thread = None
@@ -2079,11 +2103,24 @@ class App(tk.Tk):
         self._stint_vars['driver'].set(cs.get('driver_name', '—') or '—')
         self._stint_vars['lap'].set(str(live.get('current_lap', '—')))
 
-        fuel_pct = live.get('fuel_pct')
+        # Prefer sensor-based fuel % (fuel_level / capacity); fall back to plan estimate
+        tele      = ctx.get('telemetry', {})
+        sensor_l  = tele.get('fuel_level')
+        capacity  = ctx.get('plan', {}).get('fuel_capacity_l')
+        if sensor_l is not None and capacity:
+            fuel_pct = round(sensor_l / capacity * 100)
+        else:
+            fuel_pct = live.get('fuel_pct')
         self._stint_vars['fuel'].set(f"{fuel_pct}%" if fuel_pct is not None else '—')
 
         laps_pit = live.get('laps_until_pit')
-        self._stint_vars['pit'].set(str(laps_pit) if laps_pit is not None else '—')
+        if laps_pit is None:
+            pit_str = '—'
+        elif laps_pit < 0:
+            pit_str = 'OVRD'
+        else:
+            pit_str = str(laps_pit)
+        self._stint_vars['pit'].set(pit_str)
 
     # ── Background: proactive alerts ─────────────────────────────────────────
 
@@ -2096,12 +2133,22 @@ class App(tk.Tk):
                 ctx = self._ctx
             if not ctx:
                 continue
+            if ctx.get('telemetry', {}).get('stale'):
+                continue
 
             live      = ctx.get('live', {})
+            tele      = ctx.get('telemetry', {})
             now       = time.time()
             warn_laps = self._cfg.get('fuel_warning_laps', DEFAULTS['fuel_warning_laps'])
 
-            laps_of_fuel   = live.get('laps_of_fuel')
+            # Prefer live sensor + measured FPL for accuracy; fall back to plan estimate
+            fuel_sensor   = tele.get('fuel_level')
+            avg_fpl       = tele.get('fuel_delta', {}).get('avg_actual_fpl')
+            if fuel_sensor is not None and avg_fpl:
+                laps_of_fuel = fuel_sensor / avg_fpl
+            else:
+                laps_of_fuel = live.get('laps_of_fuel')
+
             laps_until_pit = live.get('laps_until_pit')
             pit_status     = live.get('pit_window_status', '')
             pit_optimal    = live.get('pit_window_optimal', '?')
@@ -2286,7 +2333,8 @@ class App(tk.Tk):
         if not self._recording:
             return
         self._recording = False
-        self.after(0, self._reset_talk_label)
+        self.after(0, lambda: self.talk_label.config(
+            bg=BG3, fg=YELLOW, text='● PROCESSING…'))
         try:
             self._stream.stop()
             self._stream.close()
@@ -2295,17 +2343,25 @@ class App(tk.Tk):
 
         chunks = self._audio_chunks
         if not chunks:
+            self.after(0, self._reset_talk_label)
             return
 
         def _save_and_process():
             try:
-                audio       = np.concatenate(chunks, axis=0).flatten()
-                wav_path    = tempfile.mktemp(suffix='.wav')
+                audio = np.concatenate(chunks, axis=0).flatten()
+                # Drop recordings shorter than 0.5 s — avoids wasting a query on a stray tap
+                if len(audio) < 8000:
+                    self.after(0, self._reset_talk_label)
+                    return
+                # NamedTemporaryFile avoids the TOCTOU race of mktemp()
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
+                    wav_path = tmp.name
                 audio_int16 = (audio * 32767).astype(np.int16)
                 wavfile.write(wav_path, 16000, audio_int16)
                 self._process_voice(wav_path)
             except Exception as e:
                 self.log(f'Recording save error: {e}')
+                self.after(0, self._reset_talk_label)
 
         threading.Thread(target=_save_and_process, daemon=True).start()
 
@@ -2315,6 +2371,7 @@ class App(tk.Tk):
         token = self._cfg.get('token', '')
         if not token:
             self.log('Not logged in — cannot process voice')
+            self.after(0, self._reset_talk_label)
             return
         try:
             with open(wav_path, 'rb') as f:
@@ -2326,14 +2383,17 @@ class App(tk.Tk):
                 )
             if not r.ok:
                 self.log(f'Transcription error: {r.text[:80]}')
+                self.after(0, self._reset_talk_label)
                 return
             question = r.json().get('transcript', '').strip()
             if not question:
+                self.after(0, self._reset_talk_label)
                 return
             self.log(f'You: "{question}"')
             self._ask_engineer(question)
         except Exception as e:
             self.log(f'Voice error: {e}')
+            self.after(0, self._reset_talk_label)
         finally:
             try:
                 os.remove(wav_path)
@@ -2362,6 +2422,7 @@ class App(tk.Tk):
         system_prompt = self._build_system_prompt(ctx) if ctx else ''
         self._convo_history.append({'role': 'user', 'content': question})
         messages = self._convo_history[-6:]
+        self.after(0, lambda: self.set_status('thinking'))
         try:
             r = requests.post(
                 f'{BACKEND_URL}/engineer/ask',
@@ -2397,6 +2458,12 @@ class App(tk.Tk):
             self.speak(answer)
         except Exception as e:
             self.log(f'Engineer error: {e}')
+        finally:
+            # Restore status dot and talk label (clears "PROCESSING…" / "Thinking…")
+            with self._ctx_lock:
+                has_ctx = bool(self._ctx)
+            self.after(0, lambda: self.set_status('connected' if has_ctx else 'stopped'))
+            self.after(0, self._reset_talk_label)
 
     def _build_system_prompt(self, ctx: dict) -> str:
         plan = ctx.get('plan', {})
@@ -2423,11 +2490,6 @@ class App(tk.Tk):
             v = _c_to_f(c) if imperial else c
             return f"{v:.0f}{'°F' if imperial else '°C'}"
 
-        def fmt_pres(kpa):
-            if kpa is None: return '?'
-            v = _kpa_to_psi(kpa) if imperial else kpa
-            return f"{v:.1f}{'psi' if imperial else 'kPa'}"
-
         session = ctx.get('session', {})
         weather = ctx.get('weather', {})
 
@@ -2449,24 +2511,57 @@ class App(tk.Tk):
         if sess_type:
             lines.append(f"SESSION TYPE: {sess_type}")
 
-        lines += [
-            f"RACE: {plan.get('name', 'Unknown')} | Duration: {plan.get('race_duration_hrs', '?')}h",
-            f"LAP: {live.get('current_lap', '?')} | DRIVER: {cs.get('driver_name', '?')} "
-            f"| STINT: {cs.get('stint_num', '?')} of {plan.get('total_stints', '?')}",
-            f"FUEL: {safe_float(live.get('fuel_remaining_l'))}L remaining | "
-            f"{safe_float(live.get('laps_of_fuel'))} laps | {live.get('fuel_pct', '?')}%",
-            f"PIT WINDOW: lap {live.get('pit_window_optimal', '?')} "
-            f"(last safe: {live.get('pit_window_last', '?')}) | "
-            f"{live.get('laps_until_pit', '?')} laps away | "
-            f"Status: {str(live.get('pit_window_status', '?')).upper()}",
-            f"PIT LOSS: {plan.get('pit_loss_s', 35)}s (configured — verify for this track/car)",
-        ]
+        # Fuel display — prefer live iRacing sensor; show plan estimate alongside
+        fuel_sensor_l = tele.get('fuel_level')  # raw sensor value from iRacing
+        fuel_plan_l   = live.get('fuel_remaining_l')  # plan-calculated estimate
+
+        def _fmt_fuel(litres):
+            if litres is None:
+                return '?'
+            return f"{litres / 3.78541:.2f}gal" if imperial else f"{litres:.1f}L"
+
+        if fuel_sensor_l is not None:
+            fuel_disp = f"{_fmt_fuel(fuel_sensor_l)} (sensor)"
+            if fuel_plan_l is not None:
+                fuel_disp += f" / {_fmt_fuel(fuel_plan_l)} (plan est.)"
+        else:
+            fuel_disp = _fmt_fuel(fuel_plan_l)
+
+        race_hrs = plan.get('race_duration_hrs', '?')
+        try:
+            race_hrs_fmt = (f"{float(race_hrs):.0f} min"
+                            if isinstance(race_hrs, (int, float)) and race_hrs < 1
+                            else f"{race_hrs}h")
+        except (TypeError, ValueError):
+            race_hrs_fmt = f"{race_hrs}h"
+
+        if live.get('status') == 'finished':
+            lines += [
+                f"RACE: {plan.get('name', 'Unknown')} | Duration: {race_hrs_fmt}",
+                f"LAP: {live.get('current_lap', '?')} | STATUS: RACE COMPLETE — all planned stints finished",
+            ]
+        else:
+            lines += [
+                f"RACE: {plan.get('name', 'Unknown')} | Duration: {race_hrs_fmt}",
+                f"LAP: {live.get('current_lap', '?')} | DRIVER: {cs.get('driver_name', '?')} "
+                f"| STINT: {cs.get('stint_num', '?')} of {plan.get('total_stints', '?')}",
+                f"FUEL: {fuel_disp} remaining | "
+                f"{safe_float(live.get('laps_of_fuel'))} laps | {live.get('fuel_pct', '?')}%",
+                f"PIT WINDOW: lap {live.get('pit_window_optimal', '?')} "
+                f"(last safe: {live.get('pit_window_last', '?')}) | "
+                f"{live.get('laps_until_pit', '?')} laps away | "
+                f"Status: {str(live.get('pit_window_status', '?')).upper()}",
+                f"PIT LOSS: {plan.get('pit_loss_s', 35)}s (configured — verify for this track/car)",
+            ]
 
         # Session time/laps remaining
         tr = session.get('time_remaining_s')
         lr = session.get('laps_remaining')
         if tr is not None and tr >= 0:
-            lines.append(f"TIME REMAINING: {tr/3600:.2f}h ({tr/60:.0f} min)")
+            if tr < 3600:
+                lines.append(f"TIME REMAINING: {tr/60:.0f} min")
+            else:
+                lines.append(f"TIME REMAINING: {tr/3600:.2f}h ({tr/60:.0f} min)")
         elif lr is not None and lr >= 0:
             lines.append(f"LAPS REMAINING: {lr}")
 
@@ -2518,34 +2613,22 @@ class App(tk.Tk):
             if opp_parts:
                 lines.append(f"OPPONENTS: {' | '.join(opp_parts)}")
 
-        tires = tele.get('tires', {})
-        if tires:
-            tire_lines = ["TIRES (hot):"]
-            for corner in ('LF', 'RF', 'LR', 'RR'):
-                t = tires.get(corner, {})
-                pres = fmt_pres(t.get('pressure_kpa'))
-                ti   = fmt_temp(t.get('temp_inner_c'))
-                tm   = fmt_temp(t.get('temp_mid_c'))
-                to_  = fmt_temp(t.get('temp_outer_c'))
-                wear = f"{t['wear_pct']:.0f}%" if t.get('wear_pct') is not None else '?'
-                tire_lines.append(
-                    f"  {corner}: {pres} | temps {ti}/{tm}/{to_} (inner/mid/outer) | wear {wear}"
-                )
-            lines += tire_lines
-
         lines.append("")
         lines.append("STINT PLAN SUMMARY:")
-        for s in plan.get('stints', [])[:plan.get('total_stints', 99)]:
-            marker  = "-> " if s.get('stint_num') == cs.get('stint_num') else "   "
-            pit_str = f"pit lap {s['pit_lap']}" if s.get('pit_lap') else "FINAL"
-            lines.append(
-                f"{marker}Stint {s['stint_num']}: {s.get('driver_name', '?')} "
-                f"laps {s['start_lap']}-{s['end_lap']} ({pit_str}) {s['fuel_load']}L"
-            )
+        stints_list = plan.get('stints', [])[:plan.get('total_stints', 99)]
+        if not stints_list:
+            lines.append("  (No stint plan loaded — waiting for iRacing session data or manual plan.)")
+        else:
+            for s in stints_list:
+                marker  = "-> " if s.get('stint_num') == cs.get('stint_num') else "   "
+                pit_str = f"pit lap {s['pit_lap']}" if s.get('pit_lap') else "FINAL"
+                lines.append(
+                    f"{marker}Stint {s['stint_num']}: {s.get('driver_name', '?')} "
+                    f"laps {s['start_lap']}-{s['end_lap']} ({pit_str}) {s['fuel_load']}L"
+                )
 
         temp_unit = '°F' if imperial else '°C'
-        pres_unit = 'psi' if imperial else 'kPa'
-        lines.append(f"\nUNITS: Always express temperatures in {temp_unit} and pressures in {pres_unit}.")
+        lines.append(f"\nUNITS: Always express temperatures in {temp_unit}.")
 
         return "\n".join(lines)
 
@@ -2559,13 +2642,21 @@ class App(tk.Tk):
             return f"{m} minute{'s' if m != 1 else ''} {sec:.1f} seconds"
         return f"{sec:.1f} seconds"
 
-    def _on_lap_complete(self, lap_num: int, lap_time: float, fpl):
+    _RACE_SESSION_TYPES   = {'race'}
+    _QUALI_SESSION_TYPES  = {'lone qualify', 'open qualify', 'qualify'}
+
+    def _on_lap_complete(self, lap_num: int, lap_time: float, fpl, session_type: str = ''):
         if lap_num <= self._last_coached_lap:
             return
         if lap_num < 2:
             self._last_coached_lap = lap_num
             return
         if not self._running:
+            return
+        st = session_type.lower() if session_type else ''
+        # Skip entirely for practice / open-practice / unknown session types
+        if st and st not in self._RACE_SESSION_TYPES and st not in self._QUALI_SESSION_TYPES:
+            self._last_coached_lap = lap_num
             return
 
         if self._session_best_lap <= 0 or lap_time < self._session_best_lap:
@@ -2587,7 +2678,8 @@ class App(tk.Tk):
         recent = self._lap_times_this_session[-5:]
         avg    = sum(recent) / len(recent) if recent else lap_time
         is_slow = len(recent) >= 3 and lap_time > avg * 1.03
-        is_check_in = lap_num % 5 == 0
+        _ci = self._cfg.get('checkin_laps', 5)
+        is_check_in = bool(_ci) and (lap_num % _ci == 0)
 
         if not (is_pb or is_slow or is_check_in):
             return
@@ -2608,24 +2700,46 @@ class App(tk.Tk):
         else:
             self.speak(f"Lap {lap_num} check-in, {spoken_time}.")
 
+        # Skip if a coaching request is already in flight — prevents API pile-up
+        if self._coaching_in_flight:
+            return
+        self._coaching_in_flight = True
         threading.Thread(
             target=self._ask_lap_coaching,
-            args=(lap_num, lap_time, fpl, reason),
+            args=(lap_num, lap_time, fpl, reason, st),
             daemon=True,
         ).start()
 
-    def _ask_lap_coaching(self, lap_num: int, lap_time: float, fpl, reason: str):
-        recent  = self._lap_times_this_session[-5:]
-        avg     = sum(recent) / len(recent) if recent else lap_time
-        fpl_str = f'FPL: {fpl:.3f}L. ' if fpl is not None else ''
-        question = (
-            f"Lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. {fpl_str}{reason}. "
-            f"Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
-            f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
-            f"The lap time was already announced to the driver — give brief coaching only, "
-            f"do not repeat the lap time. Always express times as minutes and seconds (e.g. "
-            f"'1 minute 14 seconds'), never as total seconds."
-        )
+    def _ask_lap_coaching(self, lap_num: int, lap_time: float, fpl, reason: str,
+                          session_type: str = ''):
+        recent   = self._lap_times_this_session[-5:]
+        avg      = sum(recent) / len(recent) if recent else lap_time
+        imperial = (self._cfg.get('units_system', 'metric') == 'imperial')
+        if fpl is not None:
+            fpl_val = f"{fpl / 3.78541:.3f}gal" if imperial else f"{fpl:.3f}L"
+            fpl_str = f'FPL: {fpl_val}. '
+        else:
+            fpl_str = ''
+
+        is_quali = session_type in self._QUALI_SESSION_TYPES
+        if is_quali:
+            question = (
+                f"Qualifying lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
+                f"{reason}. Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
+                f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
+                f"This is a qualifying session — focus only on lap time and driving technique, "
+                f"no race strategy or fuel. The lap time was already read out — do not repeat it."
+            )
+        else:
+            question = (
+                f"Lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
+                f"{fpl_str}{reason}. "
+                f"Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
+                f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
+                f"The lap time was already announced to the driver — give brief coaching only, "
+                f"do not repeat the lap time. Always express times as minutes and seconds (e.g. "
+                f"'1 minute 14 seconds'), never as total seconds."
+            )
         self._add_session_note(f"Lap {lap_num}: {lap_time:.3f}s ({reason})")
 
         def _do():
@@ -2650,6 +2764,8 @@ class App(tk.Tk):
                         self.speak(answer)
             except Exception as e:
                 self.log(f'Coaching error: {e}')
+            finally:
+                self._coaching_in_flight = False
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -2667,8 +2783,11 @@ class App(tk.Tk):
     # ── TTS ───────────────────────────────────────────────────────────────────
 
     def speak(self, text: str):
-        """Queue text for speaking — never blocks, never double-plays."""
-        self._tts_queue.put(text)
+        """Queue text for speaking — never blocks, drops overflow to avoid backlog."""
+        try:
+            self._tts_queue.put_nowait(text)
+        except queue.Full:
+            pass
 
     def _tts_worker(self):
         """Single persistent TTS thread — processes one utterance at a time."""
@@ -2691,22 +2810,34 @@ class App(tk.Tk):
                         sapi5_engine.runAndWait()
                 else:
                     # edge-tts neural voice — save to temp MP3, play via pygame
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
-                    tmp.close()
-                    asyncio.run(self._edge_tts_save(text, voice_id, tmp.name))
-                    if PYGAME_AVAILABLE:
-                        if not pygame.mixer.get_init():
-                            pygame.mixer.init()
-                        pygame.mixer.music.load(tmp.name)
-                        pygame.mixer.music.set_volume(volume)
-                        pygame.mixer.music.play()
-                        while pygame.mixer.music.get_busy():
-                            time.sleep(0.05)
-                        pygame.mixer.music.unload()
                     try:
-                        os.remove(tmp.name)
-                    except Exception:
-                        pass
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+                        tmp.close()
+                        asyncio.run(self._edge_tts_save(text, voice_id, tmp.name))
+                        if PYGAME_AVAILABLE:
+                            if not pygame.mixer.get_init():
+                                pygame.mixer.init()
+                            pygame.mixer.music.load(tmp.name)
+                            pygame.mixer.music.set_volume(volume)
+                            pygame.mixer.music.play()
+                            while pygame.mixer.music.get_busy():
+                                time.sleep(0.05)
+                            pygame.mixer.music.unload()
+                        try:
+                            os.remove(tmp.name)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        # edge-tts network failure — fall back to sapi5 so the
+                        # driver still hears the message mid-race
+                        self.log(f'edge-tts error (falling back to SAPI5): {e}')
+                        if sapi5_engine is None and TTS_AVAILABLE:
+                            sapi5_engine = pyttsx3.init()
+                            sapi5_engine.setProperty('rate', 175)
+                        if sapi5_engine:
+                            sapi5_engine.setProperty('volume', volume)
+                            sapi5_engine.say(text)
+                            sapi5_engine.runAndWait()
             except Exception as e:
                 self.log(f'TTS error: {e}')
 
@@ -2723,6 +2854,7 @@ class App(tk.Tk):
             'error':      (ACCENT, 'Connection error — retrying'),
             'stopped':    (BORDER, 'Stopped'),
             'connecting': (YELLOW, 'Connecting to iRacing…'),
+            'thinking':   (CYAN,   'Thinking…'),
         }
         color, text = colors.get(status, (BORDER, status))
         self.after(0, lambda: (
