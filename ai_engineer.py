@@ -18,8 +18,8 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.6"
-GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
+VERSION     = "1.1.7"
+GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
 def _ensure(package, import_name=None):
