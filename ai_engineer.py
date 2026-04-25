@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.7"
+VERSION     = "1.1.8"
 GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -356,6 +356,8 @@ def _build_auto_plan_from_ir(ir) -> dict | None:
 
         return {
             'name':              plan_name,
+            'track':             track_name,
+            'car':               car_name,
             'race_duration_hrs': race_duration_hrs,
             'lap_time_s':        round(est_lap_s, 3),
             'fuel_capacity_l':   round(capacity_l, 2),
@@ -415,11 +417,18 @@ class TelemetryThread(threading.Thread):
                 stints    = self._app._stints
                 fuel_unit = self._app._cfg.get('fuel_unit', 'gal')
 
-                current_lap   = ir['Lap']             or 0
-                fuel_raw      = ir['FuelLevel']        or 0.0
-                session_time  = ir['SessionTime']      or 0.0
-                lap_last      = ir['LapLastLapTime']   or 0.0
-                lap_completed = ir['LapCompleted']     or 0
+                current_lap    = ir['Lap']                       or 0
+                fuel_raw       = ir['FuelLevel']                 or 0.0
+                session_time   = ir['SessionTime']               or 0.0
+                lap_last       = ir['LapLastLapTime']            or 0.0
+                lap_completed  = ir['LapCompleted']              or 0
+                session_type   = ir['SessionType']               or ''
+                time_remain_s  = ir['SessionTimeRemain']
+                laps_remain    = ir['SessionLapsRemainEx']
+                incidents      = ir['PlayerCarTeamIncidentCount'] or 0
+                air_temp_c     = ir['AirTemp']
+                track_temp_c   = ir['TrackTempCrew']
+                weather_wet    = bool(ir['WeatherDeclaredWet'] or False)
 
                 # Opponent data
                 car_idx_positions = ir['CarIdxPosition']   or []
@@ -507,6 +516,10 @@ class TelemetryThread(threading.Thread):
                         'wear_pct':     round(_ir_float(wl) * 100, 1) if _ir_float(wl) is not None else None,
                     }
 
+                def _safe(v):
+                    try: return round(float(v), 2) if v is not None else None
+                    except: return None
+
                 ctx = {
                     'plan': {
                         **plan,
@@ -516,14 +529,26 @@ class TelemetryThread(threading.Thread):
                     },
                     'live': live,
                     'telemetry': {
-                        'current_lap':     current_lap,
-                        'fuel_level':      round(fuel, 3),
-                        'last_lap_time_s': round(lap_last, 3) if lap_last > 0 else None,
-                        'session_time_s':  round(session_time, 1),
-                        'fuel_delta':      fuel_delta,
-                        'opponents':       opponents,
-                        'tires':           tires,
-                        'stale':           False,
+                        'current_lap':        current_lap,
+                        'fuel_level':         round(fuel, 3),
+                        'last_lap_time_s':    round(lap_last, 3) if lap_last > 0 else None,
+                        'session_time_s':     round(session_time, 1),
+                        'fuel_delta':         fuel_delta,
+                        'fuel_laps_measured': len(fuel_history),
+                        'opponents':          opponents,
+                        'tires':              tires,
+                        'incidents':          incidents,
+                        'stale':              False,
+                    },
+                    'session': {
+                        'type':             session_type,
+                        'time_remaining_s': _safe(time_remain_s),
+                        'laps_remaining':   int(laps_remain) if laps_remain is not None and laps_remain >= 0 else None,
+                    },
+                    'weather': {
+                        'air_temp_c':   _safe(air_temp_c),
+                        'track_temp_c': _safe(track_temp_c),
+                        'wet':          weather_wet,
                     },
                 }
 
@@ -2403,6 +2428,9 @@ class App(tk.Tk):
             v = _kpa_to_psi(kpa) if imperial else kpa
             return f"{v:.1f}{'psi' if imperial else 'kPa'}"
 
+        session = ctx.get('session', {})
+        weather = ctx.get('weather', {})
+
         lines = [
             persona_line,
             "",
@@ -2411,6 +2439,15 @@ class App(tk.Tk):
         if self._session_memory_summary:
             lines.append(self._session_memory_summary)
             lines.append("")
+
+        # Track / car / session type
+        track = plan.get('track', '')
+        car   = plan.get('car', '')
+        if track:
+            lines.append(f"TRACK: {track}" + (f" | CAR: {car}" if car else ''))
+        sess_type = session.get('type', '')
+        if sess_type:
+            lines.append(f"SESSION TYPE: {sess_type}")
 
         lines += [
             f"RACE: {plan.get('name', 'Unknown')} | Duration: {plan.get('race_duration_hrs', '?')}h",
@@ -2422,19 +2459,48 @@ class App(tk.Tk):
             f"(last safe: {live.get('pit_window_last', '?')}) | "
             f"{live.get('laps_until_pit', '?')} laps away | "
             f"Status: {str(live.get('pit_window_status', '?')).upper()}",
+            f"PIT LOSS: {plan.get('pit_loss_s', 35)}s (configured — verify for this track/car)",
         ]
+
+        # Session time/laps remaining
+        tr = session.get('time_remaining_s')
+        lr = session.get('laps_remaining')
+        if tr is not None and tr >= 0:
+            lines.append(f"TIME REMAINING: {tr/3600:.2f}h ({tr/60:.0f} min)")
+        elif lr is not None and lr >= 0:
+            lines.append(f"LAPS REMAINING: {lr}")
 
         if ns:
             lines.append(
                 f"NEXT DRIVER: {ns.get('driver_name', '?')} | Fuel load: {ns.get('fuel_load', '?')}L"
             )
 
+        # Fuel delta — flag when data is still estimated
         fd = tele.get('fuel_delta', {})
+        fuel_laps = tele.get('fuel_laps_measured', 0)
         if fd.get('avg_actual_fpl'):
             planned_fpl = plan.get('fuel_per_lap_l', '?')
             lines.append(
                 f"FUEL DELTA: actual {fd['avg_actual_fpl']:.3f}L/lap vs planned {planned_fpl}L/lap"
+                + (f" (measured over {fuel_laps} laps)" if fuel_laps >= 3 else "")
             )
+        if fuel_laps < 3:
+            lines.append(
+                f"FUEL DATA WARNING: fuel per lap is estimated ({fuel_laps}/3 measured laps). "
+                f"Do not give confident fuel strategy until lap 3+."
+            )
+
+        # Incidents
+        incidents = tele.get('incidents', 0)
+        if incidents:
+            lines.append(f"INCIDENTS: {incidents}x")
+
+        # Weather / track conditions
+        if weather.get('track_temp_c') is not None or weather.get('air_temp_c') is not None:
+            cond = f"CONDITIONS: Track {fmt_temp(weather.get('track_temp_c'))} | Air {fmt_temp(weather.get('air_temp_c'))}"
+            if weather.get('wet'):
+                cond += " | DECLARED WET"
+            lines.append(cond)
 
         opponents = tele.get('opponents', {})
         if opponents:
