@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.9"
+VERSION     = "1.1.10"
 GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -399,6 +399,13 @@ class TelemetryThread(threading.Thread):
             try: return round(float(v), 2) if v is not None else None
             except (TypeError, ValueError): return None
 
+        def _find_car_at_pos(pos, positions, f2times, excl_idx, names):
+            for idx, p in enumerate(positions):
+                if p == pos and idx != excl_idx:
+                    gap = f2times[idx] if idx < len(f2times) else 0.0
+                    return {'position': pos, 'name': names.get(idx, '?'), 'gap': abs(gap or 0.0)}
+            return None
+
         while not self._stop.is_set():
             try:
                 if not ir.is_initialized or not ir.is_connected:
@@ -447,8 +454,9 @@ class TelemetryThread(threading.Thread):
                 my_car_idx        = ir['PlayerCarIdx']       or 0
                 driver_info       = ir['DriverInfo']         or {}
 
-                # Convert fuel to litres if the plan uses litres
-                fuel = fuel_raw * 3.78541 if fuel_unit == 'l' else fuel_raw
+                # iRacing FuelLevel is always in litres; plan values are also in litres.
+                # fuel_unit is display-only — no conversion needed here.
+                fuel = fuel_raw
 
                 # Rolling fuel-per-lap delta
                 fuel_delta = {}
@@ -484,13 +492,6 @@ class TelemetryThread(threading.Thread):
                     drivers     = driver_info.get('Drivers', []) or []
                     idx_map     = {d.get('CarIdx', -1): d.get('UserName', '?') for d in drivers}
 
-                    def _find_car_at_pos(pos, positions, f2times, excl_idx, names):
-                        for idx, p in enumerate(positions):
-                            if p == pos and idx != excl_idx:
-                                gap = f2times[idx] if idx < len(f2times) else 0.0
-                                return {'position': pos, 'name': names.get(idx, '?'), 'gap': abs(gap or 0.0)}
-                        return None
-
                     if my_pos > 1:
                         ahead = _find_car_at_pos(my_pos - 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map)
                         if ahead:
@@ -503,10 +504,6 @@ class TelemetryThread(threading.Thread):
                     self._app.log(f'Opponents parse error: {e}')
 
                 live = _calc_live_status(current_lap, stints, plan) if stints else {}
-
-                def _safe(v):
-                    try: return round(float(v), 2) if v is not None else None
-                    except (TypeError, ValueError): return None
 
                 ctx = {
                     'plan': {
@@ -872,6 +869,7 @@ class App(tk.Tk):
         cb = ttk.Combobox(frm, textvariable=self.v_fuel_unit, values=['gal', 'l'],
                           state='readonly', width=6)
         cb.grid(row=4, column=1, sticky='w', pady=3)
+        cb.bind('<<ComboboxSelected>>', lambda _: self._save_fuel_unit_pref())
 
         # Row 5: Personality
         ttk.Label(frm, text='Personality').grid(row=5, column=0, sticky='w', pady=3, padx=(0, 10))
@@ -931,6 +929,10 @@ class App(tk.Tk):
         checkin_cb.grid(row=10, column=1, sticky='w', pady=3)
         ttk.Label(frm, text='laps').grid(row=10, column=2, sticky='w', pady=3)
         checkin_cb.bind('<<ComboboxSelected>>', lambda _: self._save_checkin_pref())
+
+    def _save_fuel_unit_pref(self):
+        self._cfg['fuel_unit'] = self.v_fuel_unit.get()
+        save_config(self._cfg)
 
     def _save_spotter_pref(self):
         self._cfg['spotter_enabled'] = self.v_spotter.get()
@@ -1569,9 +1571,9 @@ class App(tk.Tk):
 
             v_race_name  = field('Race Name', 'My Race')
             v_duration   = field('Duration (hours)', '2.5')
-            v_lap_time   = field('Lap Time Target (seconds)', '92.0')
-            v_capacity   = field('Fuel Capacity (litres)', '18.5')
-            v_fpl        = field('Fuel Per Lap (litres)', '0.92')
+            v_lap_time   = field('Lap Time Target (seconds)', '120.0')
+            v_capacity   = field('Fuel Capacity (litres)', '50.0')
+            v_fpl        = field('Fuel Per Lap (litres)', '2.5')
             v_pit_loss   = field('Pit Loss Time (seconds)', '35.0')
 
             tk.Label(scroll_frm, text='Drivers', bg=BG, fg=DIM,
