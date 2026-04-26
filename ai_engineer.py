@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.10"
+VERSION     = "1.1.11"
 GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -187,13 +187,23 @@ def _binding_label(binding: dict) -> str:
 DEFAULT_RACE_PLAN = {
     'name':              'My Race',
     'race_duration_hrs': 2.5,
-    'fuel_capacity_l':   50.0,   # replace with your car's actual tank size
-    'fuel_per_lap_l':    2.5,    # replace with your car's measured fuel use
-    'lap_time_s':        120.0,  # replace with your expected lap time
+    'fuel_capacity_l':   50.0,
+    'fuel_per_lap_l':    2.5,
+    'lap_time_s':        120.0,
     'pit_loss_s':        35.0,
     'drivers': [
         {'name': 'Driver 1', 'max_hours': 2.5},
     ],
+    'championship_context': {
+        'enabled':               False,
+        'championship_name':     '',
+        'current_points':        0,
+        'points_leader_points':  0,
+        'points_leader_name':    '',
+        'points_per_position':   [25, 18, 15, 12, 10, 8, 6, 4, 2, 1],
+        'races_remaining':       10,
+        'race_number':           1,
+    },
 }
 
 
@@ -395,6 +405,13 @@ class TelemetryThread(threading.Thread):
         fuel_history       = []
         auto_plan_detected = False
 
+        # Per-connection mutable state (reset implicitly on reconnect)
+        sector_s1_delta: float | None = None  # delta vs session best at ~33% of lap
+        sector_s2_delta: float | None = None  # delta vs session best at ~67% of lap
+        opp_prev_on_pit: dict = {}            # {car_idx: bool}
+        opp_pit_entry_lap: dict = {}          # {car_idx: lap_num when entered pit}
+        dynamics_buffer: list = []            # per-tick tuples (throttle, brake, lat_accel, yaw_rate, speed_ms)
+
         def _safe(v):
             try: return round(float(v), 2) if v is not None else None
             except (TypeError, ValueError): return None
@@ -451,8 +468,37 @@ class TelemetryThread(threading.Thread):
                 # Opponent data
                 car_idx_positions = ir['CarIdxPosition']   or []
                 car_idx_f2time    = ir['CarIdxF2Time']      or []
+                car_idx_on_pit    = ir['CarIdxOnPitRoad']   or []
                 my_car_idx        = ir['PlayerCarIdx']       or 0
                 driver_info       = ir['DriverInfo']         or {}
+
+                # Sector / dynamics telemetry
+                lap_dist_pct   = float(ir['LapDistPct']                    or 0.0)
+                lap_delta_best = ir['LapDeltaToSessionBestLap']
+                lap_delta_ok   = bool(ir['LapDeltaToSessionBestLap_OK']    or False)
+                track_wetness  = int(ir['TrackWetness']                    or 0)
+                throttle_in    = float(ir['Throttle']                      or 0.0)
+                brake_in       = float(ir['Brake']                         or 0.0)
+                lat_accel_in   = float(ir['LatAccel']                      or 0.0)
+                yaw_rate_in    = float(ir['YawRate']                       or 0.0)
+                speed_ms_in    = float(ir['Speed']                         or 0.0)
+
+                # Reset sector snapshots at the start of each new lap
+                if lap_dist_pct < 0.05:
+                    sector_s1_delta = None
+                    sector_s2_delta = None
+
+                # Capture sector deltas at ~33% and ~67% of lap distance
+                if (0.31 < lap_dist_pct < 0.37 and sector_s1_delta is None
+                        and lap_delta_ok and lap_delta_best is not None):
+                    sector_s1_delta = round(float(lap_delta_best), 3)
+                if (0.63 < lap_dist_pct < 0.69 and sector_s2_delta is None
+                        and lap_delta_ok and lap_delta_best is not None):
+                    sector_s2_delta = round(float(lap_delta_best), 3)
+
+                # Accumulate per-tick dynamics for end-of-lap analysis
+                dynamics_buffer.append(
+                    (throttle_in, brake_in, lat_accel_in, yaw_rate_in, speed_ms_in))
 
                 # iRacing FuelLevel is always in litres; plan values are also in litres.
                 # fuel_unit is display-only — no conversion needed here.
@@ -474,12 +520,28 @@ class TelemetryThread(threading.Thread):
                         # Update auto-detected plan's FPL once we have 3+ laps of data
                         if len(fuel_history) >= 3 and self._app._plan.get('auto_detected'):
                             self._app.after(0, lambda f=avg_fpl: self._app._update_auto_fpl(f))
-                    # Also fire lap coaching
+                    # Also fire lap coaching with sector deltas and dynamics summary
                     if lap_last > 0:
                         _fpl_for_coach = actual_fpl if (0.05 < actual_fpl < 10.0) else None
+                        _sd: dict = {}
+                        if sector_s1_delta is not None: _sd['s1'] = sector_s1_delta
+                        if sector_s2_delta is not None: _sd['s2'] = sector_s2_delta
+                        _dyn: dict = {}
+                        if dynamics_buffer:
+                            _n = len(dynamics_buffer)
+                            _dyn = {
+                                'avg_throttle': round(sum(d[0] for d in dynamics_buffer) / _n, 2),
+                                'avg_brake':    round(sum(d[1] for d in dynamics_buffer) / _n, 2),
+                                'oversteer':    sum(1 for d in dynamics_buffer
+                                                    if abs(d[3]) > 0.5 and d[0] < 0.3),
+                                'understeer':   sum(1 for d in dynamics_buffer
+                                                    if d[0] > 0.7 and abs(d[2]) < 3.0 and d[4] > 20),
+                            }
+                        dynamics_buffer.clear()
                         self._app.after(0, lambda lt=lap_last, lc=lap_completed,
-                                        fp=_fpl_for_coach, st=session_type:
-                            self._app._on_lap_complete(lc, lt, fp, st))
+                                        fp=_fpl_for_coach, st=session_type,
+                                        sd=dict(_sd), dy=dict(_dyn):
+                            self._app._on_lap_complete(lc, lt, fp, st, sd, dy))
                     last_fpl_lap = lap_completed
                 prev_fuel = fuel
 
@@ -500,6 +562,23 @@ class TelemetryThread(threading.Thread):
                     if behind:
                         opponents['behind'] = behind
                     opponents['my_position'] = my_position
+
+                    # Overcut/undercut: detect opponents entering/exiting pit road
+                    for _ci, _on_pit in enumerate(car_idx_on_pit):
+                        if _ci == my_car_idx:
+                            continue
+                        _was = opp_prev_on_pit.get(_ci, False)
+                        if bool(_on_pit) and not _was:
+                            opp_pit_entry_lap[_ci] = lap_completed
+                        elif not bool(_on_pit) and _was:
+                            _entry = opp_pit_entry_lap.pop(_ci, None)
+                            if _entry is not None:
+                                _opos = car_idx_positions[_ci] if _ci < len(car_idx_positions) else 0
+                                if my_position and _opos and abs(_opos - my_position) <= 5:
+                                    self._app.after(0, lambda n=idx_map.get(_ci, '?'),
+                                                    p=_opos, el=_entry:
+                                        self._app._on_opponent_pit_exit(n, p, el))
+                        opp_prev_on_pit[_ci] = bool(_on_pit)
                 except Exception as e:
                     self._app.log(f'Opponents parse error: {e}')
 
@@ -530,9 +609,10 @@ class TelemetryThread(threading.Thread):
                         'laps_remaining':   int(laps_remain) if laps_remain is not None and laps_remain >= 0 else None,
                     },
                     'weather': {
-                        'air_temp_c':   _safe(air_temp_c),
-                        'track_temp_c': _safe(track_temp_c),
-                        'wet':          weather_wet,
+                        'air_temp_c':    _safe(air_temp_c),
+                        'track_temp_c':  _safe(track_temp_c),
+                        'wet':           weather_wet,
+                        'track_wetness': track_wetness,  # 0=dry … 7=extremely_wet
                     },
                 }
 
@@ -675,6 +755,14 @@ class App(tk.Tk):
         self._lap_times_this_session: list = []
         self._last_coached_lap: int = 0
         self._coaching_in_flight: bool = False
+        self._prev_session_type: str = ''
+        self._session_debrief_triggered: bool = False
+        self._lap_sector_deltas: dict = {}
+        self._per_lap_dynamics: dict = {}
+        self._last_weather_alert: float = 0.0
+        self._last_overcut_alert: float = 0.0
+        self._last_weather_declared_wet: bool = False
+        self._last_track_wetness: int = 0
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -1724,9 +1812,54 @@ class App(tk.Tk):
         ttk.Button(scroll_frm, text='+ Add Driver', style='Browse.TButton',
                    command=lambda: add_driver_row()).pack(anchor='w', pady=4)
 
+        # Championship context section
+        tk.Label(scroll_frm, text='Championship Context (optional)', bg=BG, fg=DIM,
+                 font=('Segoe UI', 9, 'bold'), anchor='w').pack(fill='x', pady=(10, 2))
+        existing_champ = plan.get('championship_context', {})
+        v_champ_enabled = tk.BooleanVar(value=bool(existing_champ.get('enabled', False)))
+        champ_toggle_row = tk.Frame(scroll_frm, bg=BG)
+        champ_toggle_row.pack(fill='x')
+        tk.Checkbutton(champ_toggle_row, text='Enable championship mode',
+                       variable=v_champ_enabled, bg=BG, fg=TEXT, selectcolor=BG3,
+                       activebackground=BG, activeforeground=TEXT,
+                       font=('Segoe UI', 9)).pack(anchor='w')
+        champ_detail = tk.Frame(scroll_frm, bg=BG)
+        champ_detail.pack(fill='x', padx=10)
+
+        def cfield(lbl, default):
+            tk.Label(champ_detail, text=lbl, bg=BG, fg=DIM,
+                     font=('Segoe UI', 8), anchor='w').pack(fill='x', pady=(3, 0))
+            var = tk.StringVar(value=str(default))
+            ttk.Entry(champ_detail, textvariable=var).pack(fill='x')
+            return var
+
+        v_champ_name  = cfield('Championship Name',          existing_champ.get('championship_name', ''))
+        v_my_pts      = cfield('Your Current Points',         existing_champ.get('current_points', 0))
+        v_lead_pts    = cfield('Leader Points',               existing_champ.get('points_leader_points', 0))
+        v_lead_name   = cfield('Leader Name',                 existing_champ.get('points_leader_name', ''))
+        v_race_num    = cfield('Race Number',                  existing_champ.get('race_number', 1))
+        v_races_rem   = cfield('Races Remaining',              existing_champ.get('races_remaining', 10))
+        _pts_default  = ','.join(map(str, existing_champ.get('points_per_position',
+                                                              [25, 18, 15, 12, 10, 8, 6, 4, 2, 1])))
+        v_pts_table   = cfield('Points Per Position (comma-separated)', _pts_default)
+
+        def _toggle_champ(*_):
+            state = 'normal' if v_champ_enabled.get() else 'disabled'
+            for w in champ_detail.winfo_children():
+                try: w.config(state=state)
+                except Exception: pass
+        v_champ_enabled.trace_add('write', _toggle_champ)
+        _toggle_champ()
+
         v_err = tk.StringVar()
         tk.Label(outer, textvariable=v_err, bg=BG, fg=ACCENT,
                  font=('Segoe UI', 8), wraplength=420).pack(pady=2)
+
+        def _parse_pts_table(s):
+            try:
+                return [int(x.strip()) for x in s.split(',') if x.strip().lstrip('-').isdigit()]
+            except Exception:
+                return [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]
 
         def save_plan():
             try:
@@ -1742,6 +1875,16 @@ class App(tk.Tk):
                          'max_hours': float(vh.get())}
                         for i, (vn, vh, _) in enumerate(driver_rows)
                     ] or [{'name': 'Driver 1', 'max_hours': 2.5}],
+                    'championship_context': {
+                        'enabled':              v_champ_enabled.get(),
+                        'championship_name':    v_champ_name.get().strip(),
+                        'current_points':       int(v_my_pts.get()   or 0),
+                        'points_leader_points': int(v_lead_pts.get() or 0),
+                        'points_leader_name':   v_lead_name.get().strip(),
+                        'race_number':          int(v_race_num.get() or 1),
+                        'races_remaining':      int(v_races_rem.get() or 10),
+                        'points_per_position':  _parse_pts_table(v_pts_table.get()),
+                    },
                 }
             except ValueError as exc:
                 v_err.set(f'Invalid value: {exc}')
@@ -1910,6 +2053,129 @@ class App(tk.Tk):
                 pass
         threading.Thread(target=_do, daemon=True).start()
 
+    def _do_session_debrief(self):
+        """Generate an AI post-session debrief. Called when engineer is stopped after 5+ laps."""
+        if self._session_debrief_triggered:
+            return
+        if len(self._lap_times_this_session) < 5:
+            return
+        token = self._cfg.get('token', '')
+        if not token:
+            return
+        self._session_debrief_triggered = True
+
+        times = self._lap_times_this_session
+        n     = len(times)
+        best  = self._session_best_lap
+        avg   = sum(times) / n
+        f5    = sum(times[:5]) / min(5, n)
+        l5    = sum(times[-5:]) / min(5, n)
+        trend = l5 - f5
+        trend_word = 'improving' if trend < -0.2 else ('degrading' if trend > 0.2 else 'consistent')
+
+        with self._ctx_lock:
+            ctx = self._ctx
+        incidents   = ctx.get('telemetry', {}).get('incidents', 0) if ctx else 0
+        stints_done = 0
+        if ctx:
+            stints_done = (ctx.get('live', {}).get('current_stint', {}) or {}).get('stint_num', 0) or 0
+        avg_fpl_str = '?'
+        if ctx:
+            fd = ctx.get('telemetry', {}).get('fuel_delta', {})
+            if fd.get('avg_actual_fpl'):
+                avg_fpl_str = f"{fd['avg_actual_fpl']:.3f}L/lap"
+
+        system_prompt = self._build_system_prompt(ctx) if ctx else ''
+        question = (
+            f"Session complete — give a brief debrief. "
+            f"{n} laps. Best: {self._fmt_lap_spoken(best)}. "
+            f"Avg: {self._fmt_lap_spoken(avg)}. "
+            f"Pace trend: {trend_word} ({trend:+.2f}s first 5 vs last 5 laps). "
+            f"Incidents: {incidents}. Stints: {stints_done}. Avg fuel: {avg_fpl_str}. "
+            f"Keep it to 3 sentences — one key takeaway and one thing to improve next time."
+        )
+        self.log('[DEBRIEF] Generating session debrief…')
+
+        def _do():
+            try:
+                r = requests.post(
+                    f'{BACKEND_URL}/engineer/coaching',
+                    json={'token': token, 'system_prompt': system_prompt, 'question': question},
+                    timeout=15,
+                )
+                if r.ok:
+                    answer = r.json().get('answer', '')
+                    if answer:
+                        self.log(f'[DEBRIEF] {answer}')
+                        self.after(0, lambda: self._append_qa('[Session Debrief]', answer))
+                        self.speak(answer)
+            except Exception as e:
+                self.log(f'[DEBRIEF] Error: {e}')
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _on_opponent_pit_exit(self, opp_name: str, opp_position: int, pit_entry_lap: int):
+        """Fired when a nearby opponent exits the pits. Alerts and triggers strategy coaching."""
+        if not self._running:
+            return
+        with self._ctx_lock:
+            ctx = self._ctx
+        if not ctx:
+            return
+        if ctx.get('session', {}).get('type', '').lower() != 'race':
+            return
+        my_pos = ctx.get('telemetry', {}).get('opponents', {}).get('my_position')
+        now = time.time()
+        if now - self._last_overcut_alert < 90:
+            return
+        self._last_overcut_alert = now
+        laps_til_pit = ctx.get('live', {}).get('laps_until_pit')
+        if opp_position < (my_pos or 999):
+            msg = (f"Undercut alert: {opp_name} in P{opp_position} has pitted. "
+                   f"They'll rejoin on fresh tyres soon.")
+        else:
+            extra = (f" You have {laps_til_pit} laps to your window." if laps_til_pit else '')
+            msg = f"Strategy: P{opp_position} {opp_name} has pitted.{extra}"
+        self.log(f'[STRATEGY] {msg}')
+        self.speak(msg)
+        if not self._coaching_in_flight:
+            self._coaching_in_flight = True
+            threading.Thread(target=self._ask_strategy_coaching,
+                             args=(opp_name, opp_position, pit_entry_lap),
+                             daemon=True).start()
+
+    def _ask_strategy_coaching(self, opp_name: str, opp_position: int, pit_entry_lap: int):
+        """Ask the AI for overcut/undercut strategy analysis. Fire-and-forget thread."""
+        try:
+            with self._ctx_lock:
+                ctx = self._ctx
+            system_prompt = self._build_system_prompt(ctx) if ctx else ''
+            current_lap   = ctx.get('telemetry', {}).get('current_lap', 0) if ctx else 0
+            question = (
+                f"{opp_name} in P{opp_position} just pitted (entered on lap {pit_entry_lap}, "
+                f"we are now on lap {current_lap}). Assess the overcut/undercut implications — "
+                f"should we stay out, pit now, or adjust our window? 2-3 sentences."
+            )
+            token = self._cfg.get('token', '')
+            if not token:
+                return
+            r = requests.post(
+                f'{BACKEND_URL}/engineer/coaching',
+                json={'token': token, 'system_prompt': system_prompt, 'question': question},
+                timeout=12,
+            )
+            if r.ok:
+                answer = r.json().get('answer', '')
+                if answer:
+                    self.log(f'[STRATEGY] {answer}')
+                    self.after(0, lambda: self._append_qa(
+                        f'[Strategy] {opp_name} P{opp_position} pitted', answer))
+                    self.speak(answer)
+        except Exception as e:
+            self.log(f'Strategy coaching error: {e}')
+        finally:
+            self._coaching_in_flight = False
+
     def _load_history_from_server(self):
         """Fetch session history from backend; fall back to local JSON on failure."""
         token = self._cfg.get('token', '')
@@ -1996,12 +2262,20 @@ class App(tk.Tk):
         voice_ok = SD_AVAILABLE and SCIPY_AVAILABLE and PYNPUT_AVAILABLE
 
         # Reset all per-session state so a stop/restart is clean.
-        self._last_coached_lap       = 0
-        self._session_best_lap       = 0.0
-        self._lap_times_this_session = []
-        self._session_started        = False
-        self._convo_history          = []
-        self._coaching_in_flight     = False   # guard: only one coaching request at a time
+        self._last_coached_lap           = 0
+        self._session_best_lap           = 0.0
+        self._lap_times_this_session     = []
+        self._session_started            = False
+        self._convo_history              = []
+        self._coaching_in_flight         = False
+        self._prev_session_type          = ''
+        self._session_debrief_triggered  = False
+        self._lap_sector_deltas          = {}
+        self._per_lap_dynamics           = {}
+        self._last_weather_alert         = 0.0
+        self._last_overcut_alert         = 0.0
+        self._last_weather_declared_wet  = False
+        self._last_track_wetness         = 0
 
         self._stop_evt.clear()
         self._running = True
@@ -2060,6 +2334,8 @@ class App(tk.Tk):
 
     def stop_engineer(self):
         self._end_server_session()
+        if len(self._lap_times_this_session) >= 5:
+            self._do_session_debrief()
         self._stop_evt.set()
         self._running = False
 
@@ -2183,6 +2459,27 @@ class App(tk.Tk):
                 self.speak(msg)
                 self.log(f'[ALERT] {msg}')
                 self._last_overdue_alert = now
+
+            # Weather / track evolution alerts
+            weather = ctx.get('weather', {})
+            wet_now     = weather.get('wet', False)
+            wetness_now = weather.get('track_wetness', 0)
+            if wet_now != self._last_weather_declared_wet and now - self._last_weather_alert > 30:
+                msg = ("Session declared wet — wet tyres now permitted."
+                       if wet_now else "Session changed to dry conditions.")
+                self.speak(msg)
+                self.log(f'[WEATHER] {msg}')
+                self._last_weather_declared_wet = wet_now
+                self._last_weather_alert = now
+            elif (wetness_now >= 4 and self._last_track_wetness < 4
+                  and now - self._last_weather_alert > 60):
+                msg = "Track conditions are getting wet. Consider your pit strategy."
+                self.speak(msg)
+                self.log(f'[WEATHER] {msg}')
+                self._last_track_wetness = wetness_now
+                self._last_weather_alert = now
+            elif wetness_now < 2 and self._last_track_wetness >= 4:
+                self._last_track_wetness = wetness_now  # track has dried, reset silently
 
     # ── Keyboard listener (push-to-talk) ─────────────────────────────────────
 
@@ -2629,6 +2926,27 @@ class App(tk.Tk):
                     f"laps {s['start_lap']}-{s['end_lap']} ({pit_str}) {s['fuel_load']}L"
                 )
 
+        # Championship context
+        champ = plan.get('championship_context', {})
+        if champ.get('enabled'):
+            c_pts    = champ.get('current_points', 0)
+            l_pts    = champ.get('points_leader_points', 0)
+            gap      = l_pts - c_pts
+            pts_tbl  = champ.get('points_per_position', [25, 18, 15, 12, 10, 8, 6, 4, 2, 1])
+            pts_str  = ', '.join(f'P{i+1}={p}' for i, p in enumerate(pts_tbl[:6]))
+            lines += [
+                "",
+                "CHAMPIONSHIP CONTEXT:",
+                f"  Series: {champ.get('championship_name', '?')} "
+                f"| Race {champ.get('race_number', '?')} of "
+                f"{champ.get('races_remaining', '?')} remaining",
+                f"  Your points: {c_pts} | "
+                f"Leader: {champ.get('points_leader_name', 'P1')} ({l_pts} pts) | "
+                f"Gap: {gap:+d} pts",
+                f"  Scoring: {pts_str}",
+                "  Consider championship position when advising on risk vs. reward.",
+            ]
+
         temp_unit = '°F' if imperial else '°C'
         lines.append(f"\nUNITS: Always express temperatures in {temp_unit}.")
 
@@ -2647,7 +2965,8 @@ class App(tk.Tk):
     _RACE_SESSION_TYPES   = {'race'}
     _QUALI_SESSION_TYPES  = {'lone qualify', 'open qualify', 'qualify'}
 
-    def _on_lap_complete(self, lap_num: int, lap_time: float, fpl, session_type: str = ''):
+    def _on_lap_complete(self, lap_num: int, lap_time: float, fpl, session_type: str = '',
+                         sector_deltas: dict | None = None, lap_dynamics: dict | None = None):
         if lap_num <= self._last_coached_lap:
             return
         if lap_num < 2:
@@ -2669,6 +2988,16 @@ class App(tk.Tk):
             self._lap_times_this_session = self._lap_times_this_session[-10:]
 
         self._last_coached_lap = lap_num
+
+        # Store sector deltas and dynamics for this lap
+        if sector_deltas:
+            self._lap_sector_deltas[lap_num] = sector_deltas
+            if len(self._lap_sector_deltas) > 10:
+                del self._lap_sector_deltas[min(self._lap_sector_deltas)]
+        if lap_dynamics:
+            self._per_lap_dynamics[lap_num] = lap_dynamics
+            if len(self._per_lap_dynamics) > 10:
+                del self._per_lap_dynamics[min(self._per_lap_dynamics)]
 
         # Read current position from context for the lap record
         with self._ctx_lock:
@@ -2708,12 +3037,15 @@ class App(tk.Tk):
         self._coaching_in_flight = True
         threading.Thread(
             target=self._ask_lap_coaching,
-            args=(lap_num, lap_time, fpl, reason, st),
+            args=(lap_num, lap_time, fpl, reason, st,
+                  self._lap_sector_deltas.get(lap_num),
+                  self._per_lap_dynamics.get(lap_num)),
             daemon=True,
         ).start()
 
     def _ask_lap_coaching(self, lap_num: int, lap_time: float, fpl, reason: str,
-                          session_type: str = ''):
+                          session_type: str = '', sector_deltas: dict | None = None,
+                          lap_dynamics: dict | None = None):
         recent   = self._lap_times_this_session[-5:]
         avg      = sum(recent) / len(recent) if recent else lap_time
         imperial = (self._cfg.get('units_system', 'metric') == 'imperial')
@@ -2723,19 +3055,41 @@ class App(tk.Tk):
         else:
             fpl_str = ''
 
+        # Sector delta string
+        sector_str = ''
+        if sector_deltas:
+            parts = []
+            if 's1' in sector_deltas:
+                parts.append(f"S1: {sector_deltas['s1']:+.3f}s vs best")
+            if 's2' in sector_deltas:
+                parts.append(f"S2: {sector_deltas['s2']:+.3f}s vs best")
+            if parts:
+                sector_str = f" Sector deltas — {', '.join(parts)}."
+
+        # Handling tendencies string
+        handling_str = ''
+        if lap_dynamics:
+            h_parts = []
+            if lap_dynamics.get('oversteer', 0) > 5:
+                h_parts.append(f"oversteer moments: {lap_dynamics['oversteer']}")
+            if lap_dynamics.get('understeer', 0) > 5:
+                h_parts.append(f"understeer moments: {lap_dynamics['understeer']}")
+            if h_parts:
+                handling_str = f" Handling notes: {', '.join(h_parts)}."
+
         is_quali = session_type in self._QUALI_SESSION_TYPES
         if is_quali:
             question = (
                 f"Qualifying lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
                 f"{reason}. Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
-                f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
+                f"Avg last 5: {self._fmt_lap_spoken(avg)}.{sector_str} "
                 f"This is a qualifying session — focus only on lap time and driving technique, "
                 f"no race strategy or fuel. The lap time was already read out — do not repeat it."
             )
         else:
             question = (
                 f"Lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
-                f"{fpl_str}{reason}. "
+                f"{fpl_str}{reason}.{sector_str}{handling_str} "
                 f"Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
                 f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
                 f"The lap time was already announced to the driver — give brief coaching only, "
