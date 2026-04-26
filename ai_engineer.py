@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.11"
+VERSION     = "1.1.12"
 GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -165,6 +165,7 @@ DEFAULTS = {
     'personality':       DEFAULT_PERSONALITY,
     'units_system':      'metric',
     'checkin_laps':      5,
+    'tts_rate':          1.0,
 }
 
 def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
@@ -411,6 +412,9 @@ class TelemetryThread(threading.Thread):
         opp_prev_on_pit: dict = {}            # {car_idx: bool}
         opp_pit_entry_lap: dict = {}          # {car_idx: lap_num when entered pit}
         dynamics_buffer: list = []            # per-tick tuples (throttle, brake, lat_accel, yaw_rate, speed_ms)
+        player_on_pit_prev: bool = False
+        player_pit_entry_time: float | None = None
+        player_pit_entry_fuel: float | None = None
 
         def _safe(v):
             try: return round(float(v), 2) if v is not None else None
@@ -477,6 +481,9 @@ class TelemetryThread(threading.Thread):
                 lap_delta_best = ir['LapDeltaToSessionBestLap']
                 lap_delta_ok   = bool(ir['LapDeltaToSessionBestLap_OK']    or False)
                 track_wetness  = int(ir['TrackWetness']                    or 0)
+                session_flags  = int(ir['SessionFlags']                    or 0)
+                player_on_pit  = bool(ir['OnPitRoad']                      or False)
+                pit_sv_flags   = int(ir['PitSvFlags']                      or 0)
                 throttle_in    = float(ir['Throttle']                      or 0.0)
                 brake_in       = float(ir['Brake']                         or 0.0)
                 lat_accel_in   = float(ir['LatAccel']                      or 0.0)
@@ -545,6 +552,21 @@ class TelemetryThread(threading.Thread):
                     last_fpl_lap = lap_completed
                 prev_fuel = fuel
 
+                # Track player's own pit stops for service-time estimation
+                if player_on_pit and not player_on_pit_prev:
+                    player_pit_entry_time = session_time
+                    player_pit_entry_fuel = fuel
+                elif not player_on_pit and player_on_pit_prev and player_pit_entry_time is not None:
+                    _dur = session_time - player_pit_entry_time
+                    _fa  = max(fuel - (player_pit_entry_fuel or fuel), 0.0)
+                    _flg = pit_sv_flags
+                    if 5.0 < _dur < 120.0:
+                        self._app.after(0, lambda d=_dur, fa=_fa, fl=_flg:
+                            self._app._on_pit_stop_complete(d, fa, fl))
+                    player_pit_entry_time = None
+                    player_pit_entry_fuel = None
+                player_on_pit_prev = player_on_pit
+
                 # Build opponents dict
                 opponents = {}
                 my_position = None
@@ -612,7 +634,13 @@ class TelemetryThread(threading.Thread):
                         'air_temp_c':    _safe(air_temp_c),
                         'track_temp_c':  _safe(track_temp_c),
                         'wet':           weather_wet,
-                        'track_wetness': track_wetness,  # 0=dry … 7=extremely_wet
+                        'track_wetness': track_wetness,
+                    },
+                    'session_flags': {
+                        'blue':    bool(session_flags & 0x2000),
+                        'yellow':  bool(session_flags & 0x0010),
+                        'caution': bool(session_flags & 0x4000),
+                        'black':   bool(session_flags & 0x10000),
                     },
                 }
 
@@ -763,6 +791,10 @@ class App(tk.Tk):
         self._last_overcut_alert: float = 0.0
         self._last_weather_declared_wet: bool = False
         self._last_track_wetness: int = 0
+        self._gap_history: dict = {'ahead': [], 'behind': []}
+        self._last_blue_flag_alert: float = 0.0
+        self._prev_blue_flag: bool = False
+        self._pit_stop_log: list = []
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -820,6 +852,7 @@ class App(tk.Tk):
         self.v_units        = tk.StringVar(value=self._cfg.get('units_system', 'metric'))
         _ci_raw = self._cfg.get('checkin_laps', 5)
         self.v_checkin_laps = tk.StringVar(value='never' if not _ci_raw else str(_ci_raw))
+        self.v_tts_rate = tk.DoubleVar(value=self._cfg.get('tts_rate', 1.0))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue(maxsize=5)
@@ -1018,6 +1051,22 @@ class App(tk.Tk):
         ttk.Label(frm, text='laps').grid(row=10, column=2, sticky='w', pady=3)
         checkin_cb.bind('<<ComboboxSelected>>', lambda _: self._save_checkin_pref())
 
+        # Row 11: Voice Speed
+        ttk.Label(frm, text='Voice Speed').grid(row=11, column=0, sticky='w', pady=3, padx=(0, 10))
+        rate_frame = ttk.Frame(frm)
+        rate_frame.grid(row=11, column=1, sticky='ew', pady=3, columnspan=2)
+        tk.Scale(
+            rate_frame, variable=self.v_tts_rate,
+            from_=0.5, to=2.0, resolution=0.1, orient='horizontal',
+            bg=BG2, fg=TEXT, troughcolor=BG3, highlightthickness=0,
+            activebackground=ACCENT, length=180, showvalue=False,
+            command=lambda _: self._save_rate_pref(),
+        ).pack(side='left')
+        self._rate_label = tk.Label(rate_frame,
+                                    text=f'{self.v_tts_rate.get():.1f}x',
+                                    bg=BG2, fg=TEXT, font=('Segoe UI', 9), width=4)
+        self._rate_label.pack(side='left', padx=(6, 0))
+
     def _save_fuel_unit_pref(self):
         self._cfg['fuel_unit'] = self.v_fuel_unit.get()
         save_config(self._cfg)
@@ -1049,6 +1098,12 @@ class App(tk.Tk):
     def _save_checkin_pref(self):
         val = self.v_checkin_laps.get()
         self._cfg['checkin_laps'] = 0 if val == 'never' else int(val)
+        save_config(self._cfg)
+
+    def _save_rate_pref(self):
+        rate = self.v_tts_rate.get()
+        self._cfg['tts_rate'] = rate
+        self._rate_label.config(text=f'{rate:.1f}x')
         save_config(self._cfg)
 
     def _check_for_update(self):
@@ -1315,16 +1370,20 @@ class App(tk.Tk):
         pf.pack(fill='x', padx=14, pady=4)
 
         self._stint_vars = {
-            'driver': tk.StringVar(value='—'),
-            'lap':    tk.StringVar(value='—'),
-            'fuel':   tk.StringVar(value='—'),
-            'pit':    tk.StringVar(value='—'),
+            'driver':   tk.StringVar(value='—'),
+            'lap':      tk.StringVar(value='—'),
+            'fuel':     tk.StringVar(value='—'),
+            'pit':      tk.StringVar(value='—'),
+            'pos':      tk.StringVar(value='—'),
+            'pit_time': tk.StringVar(value='—'),
         }
         labels = [
-            ('DRIVER', 'driver', 0, 0),
-            ('LAP',    'lap',    0, 2),
-            ('FUEL %', 'fuel',   1, 0),
-            ('TO PIT', 'pit',    1, 2),
+            ('DRIVER',   'driver',   0, 0),
+            ('LAP',      'lap',      0, 2),
+            ('FUEL %',   'fuel',     1, 0),
+            ('TO PIT',   'pit',      1, 2),
+            ('POS',      'pos',      2, 0),
+            ('PIT IN',   'pit_time', 2, 2),
         ]
         for col in (0, 1, 2, 3):
             pf.columnconfigure(col, weight=1)
@@ -1341,7 +1400,7 @@ class App(tk.Tk):
             pf, text='Waiting for iRacing…', bg=BG2, fg=DIM,
             font=('Segoe UI', 9, 'italic'),
         )
-        self._waiting_label.grid(row=4, column=0, columnspan=4, pady=(4, 0))
+        self._waiting_label.grid(row=6, column=0, columnspan=4, pady=(4, 0))
 
     def _build_voice_section(self):
         vf = ttk.Frame(self)
@@ -2176,6 +2235,29 @@ class App(tk.Tk):
         finally:
             self._coaching_in_flight = False
 
+    def _on_pit_stop_complete(self, duration: float, fuel_added: float, sv_flags: int):
+        """Called on main thread when player exits pit road."""
+        services = []
+        if sv_flags & 0x0001: services.append('LF tyre')
+        if sv_flags & 0x0002: services.append('RF tyre')
+        if sv_flags & 0x0004: services.append('LR tyre')
+        if sv_flags & 0x0008: services.append('RR tyre')
+        if sv_flags & 0x0010: services.append('fuel')
+        if sv_flags & 0x0040: services.append('fast repair')
+        planned = self._plan.get('pit_loss_s', 35)
+        delta   = duration - planned
+        svc_str = ' + '.join(services) if services else 'unknown'
+        entry   = {'duration_s': round(duration, 1),
+                   'fuel_added_l': round(fuel_added, 2),
+                   'services': services}
+        self._pit_stop_log.append(entry)
+        if len(self._pit_stop_log) > 10:
+            self._pit_stop_log.pop(0)
+        msg = (f"Pit stop complete: {duration:.1f}s ({delta:+.1f}s vs plan). "
+               f"Services: {svc_str}.")
+        self.speak(msg)
+        self.log(f'[PIT] {msg}')
+
     def _load_history_from_server(self):
         """Fetch session history from backend; fall back to local JSON on failure."""
         token = self._cfg.get('token', '')
@@ -2276,6 +2358,10 @@ class App(tk.Tk):
         self._last_overcut_alert         = 0.0
         self._last_weather_declared_wet  = False
         self._last_track_wetness         = 0
+        self._gap_history                = {'ahead': [], 'behind': []}
+        self._last_blue_flag_alert       = 0.0
+        self._prev_blue_flag             = False
+        self._pit_stop_log               = []
 
         self._stop_evt.clear()
         self._running = True
@@ -2392,13 +2478,38 @@ class App(tk.Tk):
         self._stint_vars['fuel'].set(f"{fuel_pct}%" if fuel_pct is not None else '—')
 
         laps_pit = live.get('laps_until_pit')
+        mins_pit = live.get('mins_until_pit')
         if laps_pit is None:
             pit_str = '—'
+            pit_time_str = '—'
         elif laps_pit < 0:
             pit_str = 'OVRD'
+            pit_time_str = 'OVRD'
         else:
             pit_str = str(laps_pit)
+            if mins_pit is not None:
+                m = int(mins_pit)
+                s = int((mins_pit - m) * 60)
+                pit_time_str = f'{m}:{s:02d}'
+            else:
+                pit_time_str = '—'
         self._stint_vars['pit'].set(pit_str)
+        self._stint_vars['pit_time'].set(pit_time_str)
+
+        opp = ctx.get('telemetry', {}).get('opponents', {})
+        my_pos = opp.get('my_position')
+        self._stint_vars['pos'].set(f'P{my_pos}' if my_pos else '—')
+
+        # Update gap history for trend calculation in system prompt
+        for side in ('ahead', 'behind'):
+            o = opp.get(side)
+            hist = self._gap_history[side]
+            if o:
+                hist.append(o['gap'])
+                if len(hist) > 6:
+                    hist.pop(0)
+            else:
+                self._gap_history[side] = []
 
     # ── Background: proactive alerts ─────────────────────────────────────────
 
@@ -2480,6 +2591,16 @@ class App(tk.Tk):
                 self._last_weather_alert = now
             elif wetness_now < 2 and self._last_track_wetness >= 4:
                 self._last_track_wetness = wetness_now  # track has dried, reset silently
+
+            # Blue flag alert
+            flags    = ctx.get('session_flags', {})
+            blue_now = flags.get('blue', False)
+            if blue_now and not self._prev_blue_flag and now - self._last_blue_flag_alert > 20:
+                msg = "Blue flag. Let the leader through."
+                self.speak(msg)
+                self.log(f'[FLAG] {msg}')
+                self._last_blue_flag_alert = now
+            self._prev_blue_flag = blue_now
 
     # ── Keyboard listener (push-to-talk) ─────────────────────────────────────
 
@@ -2900,17 +3021,44 @@ class App(tk.Tk):
         if opponents:
             ahead   = opponents.get('ahead')
             behind  = opponents.get('behind')
+
+            def _gap_trend(side):
+                hist = self._gap_history.get(side, [])
+                if len(hist) >= 5:
+                    delta = hist[-1] - hist[-5]
+                    if delta < -0.4:
+                        return f', closing {abs(delta):.1f}s/5s'
+                    if delta > 0.4:
+                        return f', gap growing {delta:.1f}s/5s'
+                return ''
+
             opp_parts = []
             if ahead:
                 opp_parts.append(
                     f"P{ahead['position']} {ahead['name']} +{ahead['gap']:.1f}s ahead"
+                    + _gap_trend('ahead')
                 )
             if behind:
                 opp_parts.append(
                     f"P{behind['position']} {behind['name']} +{behind['gap']:.1f}s behind"
+                    + _gap_trend('behind')
                 )
             if opp_parts:
                 lines.append(f"OPPONENTS: {' | '.join(opp_parts)}")
+
+        if self._pit_stop_log:
+            last_ps     = self._pit_stop_log[-1]
+            planned_pl  = plan.get('pit_loss_s', 35)
+            delta_pl    = last_ps['duration_s'] - planned_pl
+            svc         = '+'.join(last_ps['services']) or 'unknown'
+            lines.append(
+                f"LAST PIT STOP: {last_ps['duration_s']}s "
+                f"({delta_pl:+.1f}s vs plan {planned_pl}s) | "
+                f"Fuel added: {last_ps['fuel_added_l']:.1f}L | Services: {svc}"
+            )
+            if len(self._pit_stop_log) > 1:
+                avg_dur = sum(p['duration_s'] for p in self._pit_stop_log) / len(self._pit_stop_log)
+                lines.append(f"  Avg over {len(self._pit_stop_log)} stops: {avg_dur:.1f}s")
 
         lines.append("")
         lines.append("STINT PLAN SUMMARY:")
@@ -3154,13 +3302,14 @@ class App(tk.Tk):
                 break
             voice_id = self._cfg.get('tts_voice', DEFAULT_VOICE)
             volume   = max(0.0, min(1.0, self._cfg.get('tts_volume', 1.0)))
+            rate     = max(0.5, min(2.0, self._cfg.get('tts_rate', 1.0)))
             try:
                 if voice_id == 'sapi5' or not EDGE_TTS_AVAILABLE:
                     # SAPI5 fallback — one persistent engine instance
                     if sapi5_engine is None and TTS_AVAILABLE:
                         sapi5_engine = pyttsx3.init()
-                        sapi5_engine.setProperty('rate', 175)
                     if sapi5_engine:
+                        sapi5_engine.setProperty('rate', int(175 * rate))
                         sapi5_engine.setProperty('volume', volume)
                         sapi5_engine.say(text)
                         sapi5_engine.runAndWait()
@@ -3169,7 +3318,9 @@ class App(tk.Tk):
                     try:
                         tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
                         tmp.close()
-                        asyncio.run(self._edge_tts_save(text, voice_id, tmp.name))
+                        rate_pct = round((rate - 1.0) * 100)
+                        rate_str = f'{rate_pct:+d}%'
+                        asyncio.run(self._edge_tts_save(text, voice_id, tmp.name, rate_str))
                         if PYGAME_AVAILABLE:
                             if not pygame.mixer.get_init():
                                 pygame.mixer.init()
@@ -3189,8 +3340,8 @@ class App(tk.Tk):
                         self.log(f'edge-tts error (falling back to SAPI5): {e}')
                         if sapi5_engine is None and TTS_AVAILABLE:
                             sapi5_engine = pyttsx3.init()
-                            sapi5_engine.setProperty('rate', 175)
                         if sapi5_engine:
+                            sapi5_engine.setProperty('rate', int(175 * rate))
                             sapi5_engine.setProperty('volume', volume)
                             sapi5_engine.say(text)
                             sapi5_engine.runAndWait()
@@ -3198,8 +3349,8 @@ class App(tk.Tk):
                 self.log(f'TTS error: {e}')
 
     @staticmethod
-    async def _edge_tts_save(text: str, voice: str, path: str):
-        communicate = edge_tts.Communicate(text, voice)
+    async def _edge_tts_save(text: str, voice: str, path: str, rate: str = '+0%'):
+        communicate = edge_tts.Communicate(text, voice, rate=rate)
         await communicate.save(path)
 
     # ── Status helpers ────────────────────────────────────────────────────────
