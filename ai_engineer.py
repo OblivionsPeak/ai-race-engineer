@@ -19,7 +19,7 @@ BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
 VERSION     = "1.1.15"
-GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
+GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
 def _ensure(package, import_name=None):
