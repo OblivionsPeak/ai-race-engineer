@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.13"
+VERSION     = "1.1.14"
 GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -816,6 +816,9 @@ class App(tk.Tk):
         self._prev_incidents: int = 0
         self._last_gap_alert: float = 0.0
         self._last_fuel_diverge_alert: float = 0.0
+        self._last_position_alert: float = 0.0
+        self._last_driver_swap_alert: float = 0.0
+        self._muted: bool = False
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -1203,6 +1206,17 @@ class App(tk.Tk):
 
         install_btn.config(command=do_install)
 
+    def _toggle_mute(self):
+        self._muted = not self._muted
+        if self._muted:
+            while not self._tts_queue.empty():
+                try:
+                    self._tts_queue.get_nowait()
+                except queue.Empty:
+                    break
+        self.mute_btn.config(text='Unmute' if self._muted else 'Mute')
+        self.log('[MUTE] Voice muted.' if self._muted else '[MUTE] Voice unmuted.')
+
     def _logout(self):
         self._cfg['token']        = ''
         self._cfg['display_name'] = ''
@@ -1383,6 +1397,9 @@ class App(tk.Tk):
         self.stop_btn = ttk.Button(bf, text='■  Stop', style='Stop.TButton',
                                    command=self.stop_engineer, state='disabled')
         self.stop_btn.pack(side='left')
+        self.mute_btn = ttk.Button(bf, text='Mute', style='Browse.TButton',
+                                   command=self._toggle_mute)
+        self.mute_btn.pack(side='left', padx=(8, 0))
         tk.Label(bf, text='iRacing must be running before starting.',
                  bg=BG, fg=DIM, font=('Segoe UI', 8)).pack(side='right')
 
@@ -2389,6 +2406,8 @@ class App(tk.Tk):
         self._prev_incidents         = 0
         self._last_gap_alert         = 0.0
         self._last_fuel_diverge_alert = 0.0
+        self._last_position_alert    = 0.0
+        self._last_driver_swap_alert = 0.0
 
         self._stop_evt.clear()
         self._running = True
@@ -2666,13 +2685,15 @@ class App(tk.Tk):
             my_pos_now = tele.get('opponents', {}).get('my_position')
             if (my_pos_now is not None
                     and self._prev_position is not None
-                    and my_pos_now != self._prev_position):
+                    and my_pos_now != self._prev_position
+                    and now - self._last_position_alert > 12):
                 if my_pos_now < self._prev_position:
                     msg = f"Up to P{my_pos_now}."
                 else:
                     msg = f"Down to P{my_pos_now}."
                 self.speak(msg)
                 self.log(f'[POS] {msg}')
+                self._last_position_alert = now
             if my_pos_now is not None:
                 self._prev_position = my_pos_now
 
@@ -2685,11 +2706,34 @@ class App(tk.Tk):
                 diverge_pct = abs(avg_fpl - plan_fpl) / plan_fpl * 100
                 if diverge_pct >= 15:
                     direction = 'higher' if avg_fpl > plan_fpl else 'lower'
-                    msg = (f"Fuel consumption running {diverge_pct:.0f}% {direction} than planned — "
+                    msg = (f"Fuel running {diverge_pct:.0f}% {direction} than planned — "
                            f"{avg_fpl:.2f}L/lap actual vs {plan_fpl:.2f}L planned.")
+                    if direction == 'higher':
+                        save_fpl = round(avg_fpl * 0.92, 2)
+                        msg += f" Save mode target: {save_fpl:.2f}L/lap."
+                        fuel_sensor_l = tele.get('fuel_level')
+                        if fuel_sensor_l and laps_until_pit and laps_until_pit > 0:
+                            laps_with_save = fuel_sensor_l / save_fpl
+                            if laps_with_save >= laps_until_pit:
+                                msg += " Should make the window on save."
+                            else:
+                                msg += " May need to pit earlier."
                     self.speak(msg)
                     self.log(f'[FUEL] {msg}')
                     self._last_fuel_diverge_alert = now
+
+            current_stint = live.get('current_stint', {})
+            next_stint    = live.get('next_stint', {})
+            if (next_stint
+                    and current_stint.get('driver_name') != next_stint.get('driver_name')
+                    and laps_until_pit is not None
+                    and 0 < laps_until_pit <= 5
+                    and now - self._last_driver_swap_alert > 120):
+                next_driver = next_stint.get('driver_name', 'next driver')
+                msg = f"Driver change in {laps_until_pit} laps. Get {next_driver} ready."
+                self.speak(msg)
+                self.log(f'[SWAP] {msg}')
+                self._last_driver_swap_alert = now
 
             incidents_now = tele.get('incidents', 0)
             if incidents_now > self._prev_incidents:
@@ -3386,6 +3430,8 @@ class App(tk.Tk):
 
     def speak(self, text: str):
         """Queue text for speaking — never blocks, drops overflow to avoid backlog."""
+        if self._muted:
+            return
         try:
             self._tts_queue.put_nowait(text)
         except queue.Full:
