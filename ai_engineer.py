@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.16"
+VERSION     = "1.1.17"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -402,7 +402,7 @@ class TelemetryThread(threading.Thread):
         ir                 = irsdk.IRSDK()
         ir.startup()
         last_fpl_lap       = 0
-        prev_fuel          = None
+        fuel_at_lap_end    = None   # fuel level captured at each lap boundary (not every tick)
         fuel_history       = []
         auto_plan_detected = False
 
@@ -536,22 +536,27 @@ class TelemetryThread(threading.Thread):
                 # fuel_unit is display-only — no conversion needed here.
                 fuel = fuel_raw
 
-                # Rolling fuel-per-lap delta
+                # Rolling fuel-per-lap delta.
+                # fuel_at_lap_end is captured ONLY at lap boundaries so the delta
+                # spans a full lap, not just one polling tick.
                 fuel_delta = {}
-                if lap_completed > last_fpl_lap and prev_fuel is not None:
-                    actual_fpl = round(prev_fuel - fuel, 4)
-                    if 0.05 < actual_fpl < 10.0:
-                        fuel_history.append(actual_fpl)
-                        fuel_history = fuel_history[-10:]
-                        avg_fpl = round(sum(fuel_history) / len(fuel_history), 4)
-                        fuel_delta = {
-                            'avg_actual_fpl':  avg_fpl,
-                            'last_actual_fpl': actual_fpl,
-                            'history':         list(fuel_history),
-                        }
-                        # Update auto-detected plan's FPL once we have 3+ laps of data
-                        if len(fuel_history) >= 3 and self._app._plan.get('auto_detected'):
-                            self._app.after(0, lambda f=avg_fpl: self._app._update_auto_fpl(f))
+                if lap_completed > last_fpl_lap:
+                    if fuel_at_lap_end is not None:
+                        actual_fpl = round(fuel_at_lap_end - fuel, 4)
+                        if 0.05 < actual_fpl < 10.0:
+                            fuel_history.append(actual_fpl)
+                            fuel_history = fuel_history[-10:]
+                            avg_fpl = round(sum(fuel_history) / len(fuel_history), 4)
+                            fuel_delta = {
+                                'avg_actual_fpl':  avg_fpl,
+                                'last_actual_fpl': actual_fpl,
+                                'history':         list(fuel_history),
+                            }
+                            # Update auto-detected plan's FPL once we have 3+ laps of data
+                            if len(fuel_history) >= 3 and self._app._plan.get('auto_detected'):
+                                self._app.after(0, lambda f=avg_fpl: self._app._update_auto_fpl(f))
+                    else:
+                        actual_fpl = 0.0  # first lap boundary — no delta yet
                     # Also fire lap coaching with sector deltas and dynamics summary
                     if lap_last > 0:
                         _fpl_for_coach = actual_fpl if (0.05 < actual_fpl < 10.0) else None
@@ -573,8 +578,8 @@ class TelemetryThread(threading.Thread):
                         dynamics_buffer.clear()
                         pending_lap_complete = (lap_completed, _fpl_for_coach,
                                                 dict(_sd), dict(_dyn), session_type, 2)
-                    last_fpl_lap = lap_completed
-                prev_fuel = fuel
+                    fuel_at_lap_end = fuel  # capture fuel at this lap boundary
+                    last_fpl_lap    = lap_completed
 
                 # Always expose running FPL average so the alert loop has sensor-based fuel data
                 # on every tick, not just the lap-completion tick where fuel_delta is populated.
@@ -818,6 +823,7 @@ class App(tk.Tk):
         self._session_best_lap: float = 0.0
         self._lap_times_this_session: list = []
         self._last_coached_lap: int = 0
+        self._last_handling_coached_lap: int = 0
         self._coaching_in_flight: bool = False
         self._prev_session_type: str = ''
         self._session_debrief_triggered: bool = False
@@ -2406,6 +2412,7 @@ class App(tk.Tk):
 
         # Reset all per-session state so a stop/restart is clean.
         self._last_coached_lap           = 0
+        self._last_handling_coached_lap  = 0
         self._session_best_lap           = 0.0
         self._lap_times_this_session     = []
         self._session_started            = False
@@ -3102,6 +3109,13 @@ class App(tk.Tk):
                 return '?'
             return f"{litres / 3.78541:.2f}gal" if imperial else f"{litres:.1f}L"
 
+        fd_now = tele.get('fuel_delta', {})
+        avg_fpl_now = fd_now.get('avg_actual_fpl')
+        if fuel_sensor_l is not None and avg_fpl_now:
+            sensor_laps = fuel_sensor_l / avg_fpl_now
+        else:
+            sensor_laps = None
+
         if fuel_sensor_l is not None:
             fuel_disp = f"{_fmt_fuel(fuel_sensor_l)} (sensor)"
             if fuel_plan_l is not None:
@@ -3128,7 +3142,9 @@ class App(tk.Tk):
                 f"LAP: {live.get('current_lap', '?')} | DRIVER: {cs.get('driver_name', '?')} "
                 f"| STINT: {cs.get('stint_num', '?')} of {plan.get('total_stints', '?')}",
                 f"FUEL: {fuel_disp} remaining | "
-                f"{safe_float(live.get('laps_of_fuel'))} laps | {live.get('fuel_pct', '?')}%",
+                f"{safe_float(sensor_laps if sensor_laps is not None else live.get('laps_of_fuel'))} laps"
+                f"{' (measured)' if sensor_laps is not None else ' (plan est.)'}"
+                f" | {live.get('fuel_pct', '?')}%",
                 f"PIT WINDOW: lap {live.get('pit_window_optimal', '?')} "
                 f"(last safe: {live.get('pit_window_last', '?')}) | "
                 f"{live.get('laps_until_pit', '?')} laps away | "
@@ -3378,28 +3394,35 @@ class App(tk.Tk):
             if parts:
                 sector_str = f" Sector deltas — {', '.join(parts)}."
 
-        # Handling tendencies string
+        # Handling tendencies string — suppress brake bias recs for 8 laps after one is given
+        HANDLING_COOLDOWN = 8
         handling_str = ''
         if lap_dynamics:
             h_parts = []
-            if lap_dynamics.get('oversteer', 0) > 5:
-                h_parts.append(
-                    f"oversteer events: {lap_dynamics['oversteer']} "
-                    f"(rear stepping out under braking — suggest moving brake bias forward, "
-                    f"e.g. 'add 1 click of front brake bias')"
-                )
-            if lap_dynamics.get('understeer', 0) > 5:
-                h_parts.append(
-                    f"understeer events: {lap_dynamics['understeer']} "
-                    f"(front pushing wide — suggest moving brake bias rearward, "
-                    f"e.g. 'add 1 click of rear brake bias')"
-                )
+            handling_within_cooldown = (
+                lap_num - self._last_handling_coached_lap < HANDLING_COOLDOWN
+                and self._last_handling_coached_lap > 0
+            )
+            if not handling_within_cooldown:
+                if lap_dynamics.get('oversteer', 0) > 5:
+                    h_parts.append(
+                        f"oversteer events: {lap_dynamics['oversteer']} "
+                        f"(rear stepping out under braking — suggest moving brake bias forward, "
+                        f"e.g. 'add 1 click of front brake bias')"
+                    )
+                if lap_dynamics.get('understeer', 0) > 5:
+                    h_parts.append(
+                        f"understeer events: {lap_dynamics['understeer']} "
+                        f"(front pushing wide — suggest moving brake bias rearward, "
+                        f"e.g. 'add 1 click of rear brake bias')"
+                    )
             if h_parts:
                 handling_str = (
                     f" Handling notes: {', '.join(h_parts)}."
                     f" When recommending brake bias, always give a specific direction and number of "
                     f"clicks (1-2 at a time), e.g. 'add 1 click of front brake bias'."
                 )
+                self._last_handling_coached_lap = lap_num
 
         is_quali = session_type in self._QUALI_SESSION_TYPES
         if is_quali:
