@@ -55,6 +55,8 @@ a = Analysis(
         'charset_normalizer',
         'pygame',
         'pygame.joystick',
+        'pygame.mixer',
+        'pygame.mixer.music',
         'pygame.event',
         'spotter',
         'edge_tts',
