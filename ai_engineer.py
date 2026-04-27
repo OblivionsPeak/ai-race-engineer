@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.15"
+VERSION     = "1.1.16"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -427,8 +427,11 @@ class TelemetryThread(threading.Thread):
                 if p == pos and idx != excl_idx:
                     if on_track and idx < len(on_track) and not on_track[idx]:
                         continue
-                    gap = f2times[idx] if idx < len(f2times) else 0.0
-                    return {'position': pos, 'name': names.get(idx, '?'), 'gap': abs(gap or 0.0)}
+                    gap = f2times[idx] if idx < len(f2times) else None
+                    # Negative F2Time is iRacing's sentinel for invalid/not-yet-set data
+                    if gap is None or gap < 0:
+                        return None
+                    return {'position': pos, 'name': names.get(idx, '?'), 'gap': gap}
             return None
 
         while not self._stop.is_set():
@@ -831,6 +834,7 @@ class App(tk.Tk):
         self._prev_position: int | None = None
         self._prev_incidents: int = 0
         self._last_incident_alert: float = 0.0
+        self._alert_gen: int = 0
         self._last_gap_alert: float = 0.0
         self._last_fuel_diverge_alert: float = 0.0
         self._last_position_alert: float = 0.0
@@ -2449,7 +2453,8 @@ class App(tk.Tk):
         self._telemetry_thread = TelemetryThread(self)
         self._telemetry_thread.start()
 
-        threading.Thread(target=self._alert_loop, daemon=True).start()
+        self._alert_gen += 1
+        threading.Thread(target=self._alert_loop, args=(self._alert_gen,), daemon=True).start()
 
         if self._cfg.get('spotter_enabled', True):
             try:
@@ -2585,10 +2590,10 @@ class App(tk.Tk):
 
     # ── Background: proactive alerts ─────────────────────────────────────────
 
-    def _alert_loop(self):
+    def _alert_loop(self, gen: int):
         while not self._stop_evt.is_set():
             self._stop_evt.wait(5)
-            if self._stop_evt.is_set():
+            if self._stop_evt.is_set() or gen != self._alert_gen:
                 break
             with self._ctx_lock:
                 ctx = self._ctx
@@ -2681,24 +2686,22 @@ class App(tk.Tk):
                 opp = tele.get('opponents', {})
                 if len(behind_hist) >= 5:
                     behind_delta = behind_hist[-1] - behind_hist[-5]
-                    if behind_delta < -1.0:
-                        b = opp.get('behind')
-                        if b:
-                            msg = (f"Car behind closing — {b['name']} is {b['gap']:.1f}s back "
-                                   f"and closing fast.")
-                            self.speak(msg)
-                            self.log(f'[GAP] {msg}')
-                            self._last_gap_alert = now
+                    b = opp.get('behind')
+                    if behind_delta < -1.0 and b and 0 < b['gap'] < 20:
+                        msg = (f"Car behind closing — {b['name']} is {b['gap']:.1f}s back "
+                               f"and closing fast.")
+                        self.speak(msg)
+                        self.log(f'[GAP] {msg}')
+                        self._last_gap_alert = now
                 if len(ahead_hist) >= 5 and now - self._last_gap_alert > 45:
                     ahead_delta = ahead_hist[-1] - ahead_hist[-5]
-                    if ahead_delta < -1.0:
-                        a = opp.get('ahead')
-                        if a:
-                            msg = (f"Closing on P{a['position']} — {a['gap']:.1f}s gap, "
-                                   f"gaining fast.")
-                            self.speak(msg)
-                            self.log(f'[GAP] {msg}')
-                            self._last_gap_alert = now
+                    a = opp.get('ahead')
+                    if ahead_delta < -1.0 and a and 0 < a['gap'] < 20:
+                        msg = (f"Closing on P{a['position']} — {a['gap']:.1f}s gap, "
+                               f"gaining fast.")
+                        self.speak(msg)
+                        self.log(f'[GAP] {msg}')
+                        self._last_gap_alert = now
 
             my_pos_now = tele.get('opponents', {}).get('my_position')
             if (my_pos_now is not None
