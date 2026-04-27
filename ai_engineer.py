@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.12"
+VERSION     = "1.1.13"
 GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -409,20 +409,24 @@ class TelemetryThread(threading.Thread):
         # Per-connection mutable state (reset implicitly on reconnect)
         sector_s1_delta: float | None = None  # delta vs session best at ~33% of lap
         sector_s2_delta: float | None = None  # delta vs session best at ~67% of lap
+        sector_s3_delta: float | None = None  # delta vs session best at ~92% of lap
         opp_prev_on_pit: dict = {}            # {car_idx: bool}
         opp_pit_entry_lap: dict = {}          # {car_idx: lap_num when entered pit}
         dynamics_buffer: list = []            # per-tick tuples (throttle, brake, lat_accel, yaw_rate, speed_ms)
         player_on_pit_prev: bool = False
         player_pit_entry_time: float | None = None
         player_pit_entry_fuel: float | None = None
+        pending_lap_complete: tuple | None = None  # deferred until LapLastLapTime updates
 
         def _safe(v):
             try: return round(float(v), 2) if v is not None else None
             except (TypeError, ValueError): return None
 
-        def _find_car_at_pos(pos, positions, f2times, excl_idx, names):
+        def _find_car_at_pos(pos, positions, f2times, excl_idx, names, on_track=None):
             for idx, p in enumerate(positions):
                 if p == pos and idx != excl_idx:
+                    if on_track and idx < len(on_track) and not on_track[idx]:
+                        continue
                     gap = f2times[idx] if idx < len(f2times) else 0.0
                     return {'position': pos, 'name': names.get(idx, '?'), 'gap': abs(gap or 0.0)}
             return None
@@ -473,6 +477,7 @@ class TelemetryThread(threading.Thread):
                 car_idx_positions = ir['CarIdxPosition']   or []
                 car_idx_f2time    = ir['CarIdxF2Time']      or []
                 car_idx_on_pit    = ir['CarIdxOnPitRoad']   or []
+                car_idx_on_track  = ir['CarIdxOnTrack']     or []
                 my_car_idx        = ir['PlayerCarIdx']       or 0
                 driver_info       = ir['DriverInfo']         or {}
 
@@ -490,10 +495,20 @@ class TelemetryThread(threading.Thread):
                 yaw_rate_in    = float(ir['YawRate']                       or 0.0)
                 speed_ms_in    = float(ir['Speed']                         or 0.0)
 
+                # Fire deferred lap-complete now that LapLastLapTime has had a tick to update
+                if pending_lap_complete is not None:
+                    _plc, _pfpl, _psd, _pdy, _pst = pending_lap_complete
+                    pending_lap_complete = None
+                    if lap_last > 0:
+                        self._app.after(0, lambda lt=lap_last, lc=_plc, fp=_pfpl, st=_pst,
+                                        sd=dict(_psd), dy=dict(_pdy):
+                            self._app._on_lap_complete(lc, lt, fp, st, sd, dy))
+
                 # Reset sector snapshots at the start of each new lap
                 if lap_dist_pct < 0.05:
                     sector_s1_delta = None
                     sector_s2_delta = None
+                    sector_s3_delta = None
 
                 # Capture sector deltas at ~33% and ~67% of lap distance
                 if (0.31 < lap_dist_pct < 0.37 and sector_s1_delta is None
@@ -502,6 +517,9 @@ class TelemetryThread(threading.Thread):
                 if (0.63 < lap_dist_pct < 0.69 and sector_s2_delta is None
                         and lap_delta_ok and lap_delta_best is not None):
                     sector_s2_delta = round(float(lap_delta_best), 3)
+                if (0.92 < lap_dist_pct < 0.98 and sector_s3_delta is None
+                        and lap_delta_ok and lap_delta_best is not None):
+                    sector_s3_delta = round(float(lap_delta_best), 3)
 
                 # Accumulate per-tick dynamics for end-of-lap analysis
                 dynamics_buffer.append(
@@ -533,6 +551,7 @@ class TelemetryThread(threading.Thread):
                         _sd: dict = {}
                         if sector_s1_delta is not None: _sd['s1'] = sector_s1_delta
                         if sector_s2_delta is not None: _sd['s2'] = sector_s2_delta
+                        if sector_s3_delta is not None: _sd['s3'] = sector_s3_delta
                         _dyn: dict = {}
                         if dynamics_buffer:
                             _n = len(dynamics_buffer)
@@ -545,10 +564,8 @@ class TelemetryThread(threading.Thread):
                                                     if d[0] > 0.7 and abs(d[2]) < 3.0 and d[4] > 20),
                             }
                         dynamics_buffer.clear()
-                        self._app.after(0, lambda lt=lap_last, lc=lap_completed,
-                                        fp=_fpl_for_coach, st=session_type,
-                                        sd=dict(_sd), dy=dict(_dyn):
-                            self._app._on_lap_complete(lc, lt, fp, st, sd, dy))
+                        pending_lap_complete = (lap_completed, _fpl_for_coach,
+                                                dict(_sd), dict(_dyn), session_type)
                     last_fpl_lap = lap_completed
                 prev_fuel = fuel
 
@@ -577,10 +594,10 @@ class TelemetryThread(threading.Thread):
                     idx_map     = {d.get('CarIdx', -1): d.get('UserName', '?') for d in drivers}
 
                     if my_pos > 1:
-                        ahead = _find_car_at_pos(my_pos - 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map)
+                        ahead = _find_car_at_pos(my_pos - 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map, car_idx_on_track)
                         if ahead:
                             opponents['ahead'] = ahead
-                    behind = _find_car_at_pos(my_pos + 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map)
+                    behind = _find_car_at_pos(my_pos + 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map, car_idx_on_track)
                     if behind:
                         opponents['behind'] = behind
                     opponents['my_position'] = my_position
@@ -795,6 +812,10 @@ class App(tk.Tk):
         self._last_blue_flag_alert: float = 0.0
         self._prev_blue_flag: bool = False
         self._pit_stop_log: list = []
+        self._prev_position: int | None = None
+        self._prev_incidents: int = 0
+        self._last_gap_alert: float = 0.0
+        self._last_fuel_diverge_alert: float = 0.0
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -1376,6 +1397,7 @@ class App(tk.Tk):
             'pit':      tk.StringVar(value='—'),
             'pos':      tk.StringVar(value='—'),
             'pit_time': tk.StringVar(value='—'),
+            'last_lap': tk.StringVar(value='—'),
         }
         labels = [
             ('DRIVER',   'driver',   0, 0),
@@ -1384,6 +1406,7 @@ class App(tk.Tk):
             ('TO PIT',   'pit',      1, 2),
             ('POS',      'pos',      2, 0),
             ('PIT IN',   'pit_time', 2, 2),
+            ('LAST LAP', 'last_lap', 3, 0),
         ]
         for col in (0, 1, 2, 3):
             pf.columnconfigure(col, weight=1)
@@ -1400,7 +1423,7 @@ class App(tk.Tk):
             pf, text='Waiting for iRacing…', bg=BG2, fg=DIM,
             font=('Segoe UI', 9, 'italic'),
         )
-        self._waiting_label.grid(row=6, column=0, columnspan=4, pady=(4, 0))
+        self._waiting_label.grid(row=8, column=0, columnspan=4, pady=(4, 0))
 
     def _build_voice_section(self):
         vf = ttk.Frame(self)
@@ -2362,6 +2385,10 @@ class App(tk.Tk):
         self._last_blue_flag_alert       = 0.0
         self._prev_blue_flag             = False
         self._pit_stop_log               = []
+        self._prev_position          = None
+        self._prev_incidents         = 0
+        self._last_gap_alert         = 0.0
+        self._last_fuel_diverge_alert = 0.0
 
         self._stop_evt.clear()
         self._running = True
@@ -2500,6 +2527,14 @@ class App(tk.Tk):
         my_pos = opp.get('my_position')
         self._stint_vars['pos'].set(f'P{my_pos}' if my_pos else '—')
 
+        tele_last = tele.get('last_lap_time_s')
+        if tele_last and tele_last > 0:
+            m = int(tele_last) // 60
+            s = tele_last - m * 60
+            self._stint_vars['last_lap'].set(f'{m}:{s:06.3f}')
+        else:
+            self._stint_vars['last_lap'].set('—')
+
         # Update gap history for trend calculation in system prompt
         for side in ('ahead', 'behind'):
             o = opp.get(side)
@@ -2601,6 +2636,67 @@ class App(tk.Tk):
                 self.log(f'[FLAG] {msg}')
                 self._last_blue_flag_alert = now
             self._prev_blue_flag = blue_now
+
+            gap_history = self._gap_history
+            ahead_hist  = gap_history.get('ahead', [])
+            behind_hist = gap_history.get('behind', [])
+            if now - self._last_gap_alert > 45:
+                opp = tele.get('opponents', {})
+                if len(behind_hist) >= 5:
+                    behind_delta = behind_hist[-1] - behind_hist[-5]
+                    if behind_delta < -1.0:
+                        b = opp.get('behind')
+                        if b:
+                            msg = (f"Car behind closing — {b['name']} is {b['gap']:.1f}s back "
+                                   f"and closing fast.")
+                            self.speak(msg)
+                            self.log(f'[GAP] {msg}')
+                            self._last_gap_alert = now
+                if len(ahead_hist) >= 5 and now - self._last_gap_alert > 45:
+                    ahead_delta = ahead_hist[-1] - ahead_hist[-5]
+                    if ahead_delta < -1.0:
+                        a = opp.get('ahead')
+                        if a:
+                            msg = (f"Closing on P{a['position']} — {a['gap']:.1f}s gap, "
+                                   f"gaining fast.")
+                            self.speak(msg)
+                            self.log(f'[GAP] {msg}')
+                            self._last_gap_alert = now
+
+            my_pos_now = tele.get('opponents', {}).get('my_position')
+            if (my_pos_now is not None
+                    and self._prev_position is not None
+                    and my_pos_now != self._prev_position):
+                if my_pos_now < self._prev_position:
+                    msg = f"Up to P{my_pos_now}."
+                else:
+                    msg = f"Down to P{my_pos_now}."
+                self.speak(msg)
+                self.log(f'[POS] {msg}')
+            if my_pos_now is not None:
+                self._prev_position = my_pos_now
+
+            fd       = tele.get('fuel_delta', {})
+            avg_fpl  = fd.get('avg_actual_fpl')
+            plan_fpl = ctx.get('plan', {}).get('fuel_per_lap_l')
+            fuel_laps_measured = tele.get('fuel_laps_measured', 0)
+            if (avg_fpl and plan_fpl and plan_fpl > 0 and fuel_laps_measured >= 3
+                    and now - self._last_fuel_diverge_alert > 300):
+                diverge_pct = abs(avg_fpl - plan_fpl) / plan_fpl * 100
+                if diverge_pct >= 15:
+                    direction = 'higher' if avg_fpl > plan_fpl else 'lower'
+                    msg = (f"Fuel consumption running {diverge_pct:.0f}% {direction} than planned — "
+                           f"{avg_fpl:.2f}L/lap actual vs {plan_fpl:.2f}L planned.")
+                    self.speak(msg)
+                    self.log(f'[FUEL] {msg}')
+                    self._last_fuel_diverge_alert = now
+
+            incidents_now = tele.get('incidents', 0)
+            if incidents_now > self._prev_incidents:
+                msg = f"Incident! You're now on {incidents_now} incident point{'s' if incidents_now != 1 else ''}."
+                self.speak(msg)
+                self.log(f'[INCIDENT] {msg}')
+            self._prev_incidents = incidents_now
 
     # ── Keyboard listener (push-to-talk) ─────────────────────────────────────
 
@@ -3211,6 +3307,8 @@ class App(tk.Tk):
                 parts.append(f"S1: {sector_deltas['s1']:+.3f}s vs best")
             if 's2' in sector_deltas:
                 parts.append(f"S2: {sector_deltas['s2']:+.3f}s vs best")
+            if 's3' in sector_deltas:
+                parts.append(f"S3: {sector_deltas['s3']:+.3f}s vs best")
             if parts:
                 sector_str = f" Sector deltas — {', '.join(parts)}."
 
