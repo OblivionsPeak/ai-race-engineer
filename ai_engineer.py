@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.14"
+VERSION     = "1.1.15"
 GITHUB_REPO = "OblivionsPeak/neural-racing-performance"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -495,14 +495,18 @@ class TelemetryThread(threading.Thread):
                 yaw_rate_in    = float(ir['YawRate']                       or 0.0)
                 speed_ms_in    = float(ir['Speed']                         or 0.0)
 
-                # Fire deferred lap-complete now that LapLastLapTime has had a tick to update
+                # Fire deferred lap-complete — wait 2 ticks so LapLastLapTime has time to update
                 if pending_lap_complete is not None:
-                    _plc, _pfpl, _psd, _pdy, _pst = pending_lap_complete
-                    pending_lap_complete = None
-                    if lap_last > 0:
-                        self._app.after(0, lambda lt=lap_last, lc=_plc, fp=_pfpl, st=_pst,
-                                        sd=dict(_psd), dy=dict(_pdy):
-                            self._app._on_lap_complete(lc, lt, fp, st, sd, dy))
+                    *_data, _ticks = pending_lap_complete
+                    if _ticks > 1:
+                        pending_lap_complete = (*_data, _ticks - 1)
+                    else:
+                        _plc, _pfpl, _psd, _pdy, _pst = _data
+                        pending_lap_complete = None
+                        if lap_last > 0:
+                            self._app.after(0, lambda lt=lap_last, lc=_plc, fp=_pfpl, st=_pst,
+                                            sd=dict(_psd), dy=dict(_pdy):
+                                self._app._on_lap_complete(lc, lt, fp, st, sd, dy))
 
                 # Reset sector snapshots at the start of each new lap
                 if lap_dist_pct < 0.05:
@@ -565,9 +569,19 @@ class TelemetryThread(threading.Thread):
                             }
                         dynamics_buffer.clear()
                         pending_lap_complete = (lap_completed, _fpl_for_coach,
-                                                dict(_sd), dict(_dyn), session_type)
+                                                dict(_sd), dict(_dyn), session_type, 2)
                     last_fpl_lap = lap_completed
                 prev_fuel = fuel
+
+                # Always expose running FPL average so the alert loop has sensor-based fuel data
+                # on every tick, not just the lap-completion tick where fuel_delta is populated.
+                if not fuel_delta and fuel_history:
+                    _avg_fpl = round(sum(fuel_history) / len(fuel_history), 4)
+                    fuel_delta = {
+                        'avg_actual_fpl':  _avg_fpl,
+                        'last_actual_fpl': fuel_history[-1],
+                        'history':         list(fuel_history),
+                    }
 
                 # Track player's own pit stops for service-time estimation
                 if player_on_pit and not player_on_pit_prev:
@@ -723,6 +737,7 @@ def _apply_update(new_exe_path: str):
         return  # running as a .py script — skip
 
     pid      = os.getpid()
+    exe_dir  = os.path.dirname(current_exe)
     bat_path = os.path.join(tempfile.gettempdir(), '_aire_update.bat')
     bat = (
         '@echo off\n'
@@ -734,6 +749,7 @@ def _apply_update(new_exe_path: str):
         f'    goto wait\n'
         f')\n'
         f'move /y "{new_exe_path}" "{current_exe}"\n'
+        f'del /f /q "{exe_dir}\\_nrp_update_*.exe" 2>nul\n'
         f'timeout /t 4 /nobreak >nul\n'
         f'start "" "{current_exe}"\n'
         'del "%~f0"\n'
@@ -814,6 +830,7 @@ class App(tk.Tk):
         self._pit_stop_log: list = []
         self._prev_position: int | None = None
         self._prev_incidents: int = 0
+        self._last_incident_alert: float = 0.0
         self._last_gap_alert: float = 0.0
         self._last_fuel_diverge_alert: float = 0.0
         self._last_position_alert: float = 0.0
@@ -2404,6 +2421,7 @@ class App(tk.Tk):
         self._pit_stop_log               = []
         self._prev_position          = None
         self._prev_incidents         = 0
+        self._last_incident_alert    = 0.0
         self._last_gap_alert         = 0.0
         self._last_fuel_diverge_alert = 0.0
         self._last_position_alert    = 0.0
@@ -2736,11 +2754,12 @@ class App(tk.Tk):
                 self._last_driver_swap_alert = now
 
             incidents_now = tele.get('incidents', 0)
-            if incidents_now > self._prev_incidents:
+            if incidents_now > self._prev_incidents and now - self._last_incident_alert > 30:
                 msg = f"Incident! You're now on {incidents_now} incident point{'s' if incidents_now != 1 else ''}."
                 self.speak(msg)
                 self.log(f'[INCIDENT] {msg}')
-            self._prev_incidents = incidents_now
+                self._last_incident_alert = now
+            self._prev_incidents = max(self._prev_incidents, incidents_now)
 
     # ── Keyboard listener (push-to-talk) ─────────────────────────────────────
 
@@ -3361,11 +3380,23 @@ class App(tk.Tk):
         if lap_dynamics:
             h_parts = []
             if lap_dynamics.get('oversteer', 0) > 5:
-                h_parts.append(f"oversteer moments: {lap_dynamics['oversteer']}")
+                h_parts.append(
+                    f"oversteer events: {lap_dynamics['oversteer']} "
+                    f"(rear stepping out under braking — suggest moving brake bias forward, "
+                    f"e.g. 'add 1 click of front brake bias')"
+                )
             if lap_dynamics.get('understeer', 0) > 5:
-                h_parts.append(f"understeer moments: {lap_dynamics['understeer']}")
+                h_parts.append(
+                    f"understeer events: {lap_dynamics['understeer']} "
+                    f"(front pushing wide — suggest moving brake bias rearward, "
+                    f"e.g. 'add 1 click of rear brake bias')"
+                )
             if h_parts:
-                handling_str = f" Handling notes: {', '.join(h_parts)}."
+                handling_str = (
+                    f" Handling notes: {', '.join(h_parts)}."
+                    f" When recommending brake bias, always give a specific direction and number of "
+                    f"clicks (1-2 at a time), e.g. 'add 1 click of front brake bias'."
+                )
 
         is_quali = session_type in self._QUALI_SESSION_TYPES
         if is_quali:
