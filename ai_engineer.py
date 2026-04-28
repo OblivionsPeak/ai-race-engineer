@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.18"
+VERSION     = "1.1.19"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -773,6 +773,32 @@ def _apply_update(new_exe_path: str):
 
 
 # ---------------------------------------------------------------------------
+# Callout Manager — single dedup/cooldown gate for all spoken callouts.
+# Both the alert loop and SpotterThread route through here so the same event
+# cannot fire twice regardless of which subsystem detects it first.
+# ---------------------------------------------------------------------------
+class CalloutManager:
+    def __init__(self, speak_fn, log_fn=None):
+        self._speak = speak_fn
+        self._log   = log_fn or (lambda _: None)
+        self._last: dict = {}
+        self._lock  = threading.Lock()
+
+    def submit(self, key: str, message: str, cooldown_s: float = 0.0) -> bool:
+        now = time.time()
+        with self._lock:
+            if now - self._last.get(key, 0.0) < cooldown_s:
+                return False
+            self._last[key] = now
+        self._speak(message)
+        return True
+
+    def reset(self):
+        with self._lock:
+            self._last.clear()
+
+
+# ---------------------------------------------------------------------------
 # Main App
 # ---------------------------------------------------------------------------
 class App(tk.Tk):
@@ -807,6 +833,7 @@ class App(tk.Tk):
         self._kb_listener        = None
         self._telemetry_thread: TelemetryThread | None = None
         self._spotter_thread     = None
+        self._callout_mgr: CalloutManager | None = None
         self._last_fuel_alert    = 0.0
         self._ptt_down           = False
         self._last_pit_alert     = 0.0
@@ -2464,6 +2491,7 @@ class App(tk.Tk):
             self.text_input_frame.pack(fill='x', padx=14, pady=2)
 
         # ── Start threads ─────────────────────────────────────────────────
+        self._callout_mgr = CalloutManager(self.speak, lambda msg: self.log(f'[CALLOUT] {msg}'))
         self._telemetry_thread = TelemetryThread(self)
         self._telemetry_thread.start()
 
@@ -2474,7 +2502,7 @@ class App(tk.Tk):
             try:
                 from spotter import SpotterThread
                 self._spotter_thread = SpotterThread(
-                    speak_fn=self.speak,
+                    callout_mgr=self._callout_mgr,
                     log_fn=lambda msg: self.log(f'[SPOTTER] {msg}'),
                 )
                 self._spotter_thread.start()
@@ -2519,6 +2547,10 @@ class App(tk.Tk):
         if self._spotter_thread:
             self._spotter_thread.stop()
             self._spotter_thread = None
+
+        if self._callout_mgr:
+            self._callout_mgr.reset()
+            self._callout_mgr = None
 
         self._stop_keyboard_listener()
         self._joystick_thread = None  # daemon thread — exits when _stop_evt is set
@@ -2637,15 +2669,14 @@ class App(tk.Tk):
             fuel_laps_measured = tele.get('fuel_laps_measured', 0)
             if (laps_of_fuel is not None
                     and laps_of_fuel <= warn_laps
-                    and fuel_laps_measured >= 3
-                    and now - self._last_fuel_alert > 60):
+                    and fuel_laps_measured >= 3):
                 msg = (
                     f"Fuel warning. {laps_of_fuel:.1f} laps of fuel remaining. "
                     f"Pit window is lap {pit_optimal}."
                 )
-                self.speak(msg)
-                self.log(f'[ALERT] {msg}')
-                self._last_fuel_alert = now
+                if self._callout_mgr and self._callout_mgr.submit('fuel_warning', msg, cooldown_s=60):
+                    self.log(f'[ALERT] {msg}')
+                    self._last_fuel_alert = now
 
             # Approaching pit window
             if (laps_until_pit is not None
@@ -2773,11 +2804,11 @@ class App(tk.Tk):
                 self._last_driver_swap_alert = now
 
             incidents_now = tele.get('incidents', 0)
-            if incidents_now > self._prev_incidents and now - self._last_incident_alert > 30:
+            if incidents_now > self._prev_incidents:
                 msg = f"Incident! You're now on {incidents_now} incident point{'s' if incidents_now != 1 else ''}."
-                self.speak(msg)
-                self.log(f'[INCIDENT] {msg}')
-                self._last_incident_alert = now
+                if self._callout_mgr and self._callout_mgr.submit('incident', msg, cooldown_s=30):
+                    self.log(f'[INCIDENT] {msg}')
+                    self._last_incident_alert = now
             self._prev_incidents = max(self._prev_incidents, incidents_now)
 
     # ── Keyboard listener (push-to-talk) ─────────────────────────────────────
@@ -3126,11 +3157,11 @@ class App(tk.Tk):
             sensor_laps = None
 
         if fuel_sensor_l is not None:
-            fuel_disp = f"{_fmt_fuel(fuel_sensor_l)} (sensor)"
-            if fuel_plan_l is not None:
-                fuel_disp += f" / {_fmt_fuel(fuel_plan_l)} (plan est.)"
+            fuel_disp = _fmt_fuel(fuel_sensor_l)
+        elif fuel_plan_l is not None:
+            fuel_disp = f"{_fmt_fuel(fuel_plan_l)} (plan est.)"
         else:
-            fuel_disp = _fmt_fuel(fuel_plan_l)
+            fuel_disp = '?'
 
         race_hrs = plan.get('race_duration_hrs', '?')
         try:
@@ -3188,8 +3219,9 @@ class App(tk.Tk):
             )
         if fuel_laps < 3:
             lines.append(
-                f"FUEL DATA WARNING: fuel per lap is estimated ({fuel_laps}/3 measured laps). "
-                f"Do not give confident fuel strategy until lap 3+."
+                f"FUEL DATA WARNING: only {fuel_laps} of 3 minimum laps measured. "
+                f"IMPORTANT: tell the driver you are still learning their fuel burn rate and "
+                f"cannot give confident fuel strategy yet. Do not invent or guess laps-remaining."
             )
 
         # Incidents
