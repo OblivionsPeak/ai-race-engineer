@@ -15,12 +15,12 @@ VSVersionInfo(
         u'040904B0',
         [StringStruct(u'CompanyName', u'Neural Racing Performance'),
          StringStruct(u'FileDescription', u'Neural Racing Performance'),
-         StringStruct(u'FileVersion', u'1.1.17.0'),
+         StringStruct(u'FileVersion', u'1.1.18.0'),
          StringStruct(u'InternalName', u'NeuralRacingPerformance'),
          StringStruct(u'LegalCopyright', u'Neural Racing Performance 2026'),
          StringStruct(u'OriginalFilename', u'NeuralRacingPerformance.exe'),
          StringStruct(u'ProductName', u'Neural Racing Performance'),
-         StringStruct(u'ProductVersion', u'1.1.17.0')])
+         StringStruct(u'ProductVersion', u'1.1.18.0')])
     ]),
     VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
   ]

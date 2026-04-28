@@ -5,7 +5,7 @@ Push-to-talk voice assistant + proactive alerts via backend proxy.
 Reads iRacing telemetry directly via pyirsdk. No direct Anthropic/OpenAI
 API keys required — all AI queries and transcription go through the backend.
 
-Python 3.8+ is the only requirement — the script installs everything else itself.
+Python 3.10+ is the only requirement — the script installs everything else itself.
 """
 
 import json
@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.17"
+VERSION     = "1.1.18"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -824,6 +824,7 @@ class App(tk.Tk):
         self._lap_times_this_session: list = []
         self._last_coached_lap: int = 0
         self._last_handling_coached_lap: int = 0
+        self._total_laps_this_session: int = 0
         self._coaching_in_flight: bool = False
         self._prev_session_type: str = ''
         self._session_debrief_triggered: bool = False
@@ -2190,14 +2191,15 @@ class App(tk.Tk):
             return
         self._session_debrief_triggered = True
 
-        times = self._lap_times_this_session
-        n     = len(times)
-        best  = self._session_best_lap
-        avg   = sum(times) / n
-        f5    = sum(times[:5]) / min(5, n)
-        l5    = sum(times[-5:]) / min(5, n)
-        trend = l5 - f5
-        trend_word = 'improving' if trend < -0.2 else ('degrading' if trend > 0.2 else 'consistent')
+        times       = self._lap_times_this_session  # rolling last-10 window for pace analysis
+        total_laps  = self._total_laps_this_session  # true lap count regardless of window
+        n           = len(times)
+        best        = self._session_best_lap
+        avg         = sum(times) / n
+        f5          = sum(times[:5]) / min(5, n)
+        l5          = sum(times[-5:]) / min(5, n)
+        trend       = l5 - f5
+        trend_word  = 'improving' if trend < -0.2 else ('degrading' if trend > 0.2 else 'consistent')
 
         with self._ctx_lock:
             ctx = self._ctx
@@ -2214,9 +2216,9 @@ class App(tk.Tk):
         system_prompt = self._build_system_prompt(ctx) if ctx else ''
         question = (
             f"Session complete — give a brief debrief. "
-            f"{n} laps. Best: {self._fmt_lap_spoken(best)}. "
-            f"Avg: {self._fmt_lap_spoken(avg)}. "
-            f"Pace trend: {trend_word} ({trend:+.2f}s first 5 vs last 5 laps). "
+            f"{total_laps} laps total. Best: {self._fmt_lap_spoken(best)}. "
+            f"Avg (last {n}): {self._fmt_lap_spoken(avg)}. "
+            f"Pace trend: {trend_word} ({trend:+.2f}s first 5 vs last 5 of sample). "
             f"Incidents: {incidents}. Stints: {stints_done}. Avg fuel: {avg_fpl_str}. "
             f"Keep it to 3 sentences — one key takeaway and one thing to improve next time."
         )
@@ -2395,6 +2397,9 @@ class App(tk.Tk):
                 return
             self._plan   = plan
             self._stints = stints
+            # Manual plans bypass _apply_auto_plan, so start the backend session here
+            self._start_server_session(plan.get('track', plan.get('name', '')),
+                                       plan.get('car', ''))
         else:
             self._plan   = {}
             self._stints = []
@@ -2413,9 +2418,11 @@ class App(tk.Tk):
         # Reset all per-session state so a stop/restart is clean.
         self._last_coached_lap           = 0
         self._last_handling_coached_lap  = 0
+        self._total_laps_this_session    = 0
         self._session_best_lap           = 0.0
         self._lap_times_this_session     = []
         self._session_started            = False
+        self._server_session_id          = None
         self._convo_history              = []
         self._coaching_in_flight         = False
         self._prev_session_type          = ''
@@ -2626,9 +2633,11 @@ class App(tk.Tk):
             pit_status     = live.get('pit_window_status', '')
             pit_optimal    = live.get('pit_window_optimal', '?')
 
-            # Fuel warning
+            # Fuel warning — only fire when we have 3+ measured laps to avoid plan-estimate false alarms
+            fuel_laps_measured = tele.get('fuel_laps_measured', 0)
             if (laps_of_fuel is not None
                     and laps_of_fuel <= warn_laps
+                    and fuel_laps_measured >= 3
                     and now - self._last_fuel_alert > 60):
                 msg = (
                     f"Fuel warning. {laps_of_fuel:.1f} laps of fuel remaining. "
@@ -3125,7 +3134,7 @@ class App(tk.Tk):
 
         race_hrs = plan.get('race_duration_hrs', '?')
         try:
-            race_hrs_fmt = (f"{float(race_hrs):.0f} min"
+            race_hrs_fmt = (f"{float(race_hrs) * 60:.0f} min"
                             if isinstance(race_hrs, (int, float)) and race_hrs < 1
                             else f"{race_hrs}h")
         except (TypeError, ValueError):
@@ -3144,7 +3153,7 @@ class App(tk.Tk):
                 f"FUEL: {fuel_disp} remaining | "
                 f"{safe_float(sensor_laps if sensor_laps is not None else live.get('laps_of_fuel'))} laps"
                 f"{' (measured)' if sensor_laps is not None else ' (plan est.)'}"
-                f" | {live.get('fuel_pct', '?')}%",
+                f" | {(round(fuel_sensor_l / plan.get('fuel_capacity_l', fuel_sensor_l) * 100) if fuel_sensor_l and plan.get('fuel_capacity_l') else live.get('fuel_pct', '?'))}%",
                 f"PIT WINDOW: lap {live.get('pit_window_optimal', '?')} "
                 f"(last safe: {live.get('pit_window_last', '?')}) | "
                 f"{live.get('laps_until_pit', '?')} laps away | "
@@ -3309,6 +3318,7 @@ class App(tk.Tk):
         if self._session_best_lap <= 0 or lap_time < self._session_best_lap:
             self._session_best_lap = lap_time
 
+        self._total_laps_this_session += 1
         self._lap_times_this_session.append(lap_time)
         if len(self._lap_times_this_session) > 10:
             self._lap_times_this_session = self._lap_times_this_session[-10:]

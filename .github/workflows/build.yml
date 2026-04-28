@@ -33,14 +33,14 @@ jobs:
       - name: Upload EXE to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/AIRaceEngineer.exe
+          files: dist/NeuralRacingPerformance.exe
           body: |
-            ## AI Race Engineer ${{ github.ref_name }}
+            ## Neural Racing Performance ${{ github.ref_name }}
 
-            **Download AIRaceEngineer.exe below — no Python or setup required.**
+            **Download NeuralRacingPerformance.exe below — no Python or setup required.**
 
             ### First run
-            1. Download and run `AIRaceEngineer.exe`
+            1. Download and run `NeuralRacingPerformance.exe`
             2. Create a free account in the setup wizard
             3. Fill in your race plan details
             4. Start iRacing, then press Start in the engineer
