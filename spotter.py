@@ -129,19 +129,17 @@ class SpotterThread(threading.Thread):
         except Exception as e:
             self._safe_log(f"Spotter: irsdk startup error: {e}")
 
-        prev_proximity           = None
-        prev_position            = None
-        prev_lap_completed       = None
-        prev_flags               = 0
-        personal_best            = None
+        prev_proximity            = None
+        prev_position             = None
+        prev_lap_completed        = None
+        prev_flags                = 0
 
-        last_proximity_call      = 0.0
-        last_position_call       = 0.0
-        last_proximity_state     = None
+        last_proximity_call       = 0.0
+        last_position_call        = 0.0
+        last_proximity_state      = None
         last_proximity_clear_time = 0.0
 
-        time_alerts_fired        = set()
-        lapped_by                = set()
+        time_alerts_fired         = set()
 
         was_connected = False
 
@@ -177,7 +175,6 @@ class SpotterThread(threading.Thread):
                 player_idx      = _read('PlayerCarIdx')
                 player_pos      = _read('PlayerCarPosition')
                 session_flags   = _read('SessionFlags')
-                last_lap_time   = _read('LapLastLapTime')
                 session_remain  = _read('SessionTimeRemain')
                 lap_num         = _read('Lap')
                 lap_completed   = _read('LapCompleted')
@@ -230,23 +227,12 @@ class SpotterThread(threading.Thread):
 
                         prev_proximity = prox_state
 
-                # =========================================================
-                # 2. Lap completion callouts
-                # =========================================================
+                # Lap completion tracking — no callout here; main app owns lap announcements
                 if lap_completed is not None:
                     if prev_lap_completed is None:
                         prev_lap_completed = lap_completed
-                    elif lap_completed > prev_lap_completed:
+                    else:
                         prev_lap_completed = lap_completed
-
-                        if last_lap_time and last_lap_time > 0:
-                            fmt = _format_lap_time(last_lap_time)
-                            is_pb = personal_best is None or last_lap_time < personal_best
-                            if is_pb:
-                                personal_best = last_lap_time
-                                self._say(f'lap_{lap_completed}', f"Personal best! {fmt}", 0)
-                            else:
-                                self._say(f'lap_{lap_completed}', f"Last lap {fmt}", 0)
 
                 # =========================================================
                 # 3. Position change callouts (not on lap 0/1)
@@ -297,24 +283,9 @@ class SpotterThread(threading.Thread):
                             self._say(f'time_{threshold}', message, 0)
                             time_alerts_fired.add(threshold)
 
-                # =========================================================
-                # 6. Blue flag / being lapped detection
-                # =========================================================
-                if (lap_dist_pct is not None
-                        and player_idx is not None
-                        and lap_num is not None
-                        and lap_num > 1):
-                    try:
-                        our_pct = lap_dist_pct[player_idx]
-                        for i, their_pct in enumerate(lap_dist_pct):
-                            if i == player_idx or their_pct <= 0.0:
-                                continue
-                            delta = _delta_pct(their_pct, our_pct)
-                            if delta > LAPPED_THRESHOLD and i not in lapped_by:
-                                lapped_by.add(i)
-                                self._say('lapped', "Blue flag, let them through", 15)
-                    except Exception:
-                        pass
+                # Blue flag / lapped detection: handled by main app using SessionFlags.blue
+                # which is the authoritative iRacing field. Lap-distance estimation
+                # produces false positives and is removed from the spotter.
 
             except Exception as e:
                 self._safe_log(f"Spotter error: {e}")

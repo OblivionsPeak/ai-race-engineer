@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.19"
+VERSION     = "1.1.20"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -464,7 +464,7 @@ class TelemetryThread(threading.Thread):
                 fuel_unit = self._app._cfg.get('fuel_unit', 'gal')
 
                 current_lap    = ir['Lap']                       or 0
-                fuel_raw       = ir['FuelLevel']                 or 0.0
+                fuel_raw       = ir['FuelLevel']                 # None if iRacing not providing it
                 session_time   = ir['SessionTime']               or 0.0
                 lap_last       = ir['LapLastLapTime']            or 0.0
                 lap_completed  = ir['LapCompleted']              or 0
@@ -541,7 +541,7 @@ class TelemetryThread(threading.Thread):
                 # spans a full lap, not just one polling tick.
                 fuel_delta = {}
                 if lap_completed > last_fpl_lap:
-                    if fuel_at_lap_end is not None:
+                    if fuel_at_lap_end is not None and fuel is not None:
                         actual_fpl = round(fuel_at_lap_end - fuel, 4)
                         if 0.05 < actual_fpl < 10.0:
                             fuel_history.append(actual_fpl)
@@ -578,7 +578,8 @@ class TelemetryThread(threading.Thread):
                         dynamics_buffer.clear()
                         pending_lap_complete = (lap_completed, _fpl_for_coach,
                                                 dict(_sd), dict(_dyn), session_type, 2)
-                    fuel_at_lap_end = fuel  # capture fuel at this lap boundary
+                    if fuel is not None:
+                        fuel_at_lap_end = fuel  # capture fuel at this lap boundary
                     last_fpl_lap    = lap_completed
 
                 # Always expose running FPL average so the alert loop has sensor-based fuel data
@@ -2292,7 +2293,7 @@ class App(tk.Tk):
             extra = (f" You have {laps_til_pit} laps to your window." if laps_til_pit else '')
             msg = f"Strategy: P{opp_position} {opp_name} has pitted.{extra}"
         self.log(f'[STRATEGY] {msg}')
-        self.speak(msg)
+        self._say('undercut_alert', msg, 90)
         if not self._coaching_in_flight:
             self._coaching_in_flight = True
             threading.Thread(target=self._ask_strategy_coaching,
@@ -2674,56 +2675,51 @@ class App(tk.Tk):
                     f"Fuel warning. {laps_of_fuel:.1f} laps of fuel remaining. "
                     f"Pit window is lap {pit_optimal}."
                 )
-                if self._callout_mgr and self._callout_mgr.submit('fuel_warning', msg, cooldown_s=60):
+                if self._say('fuel_warning', msg, 60):
                     self.log(f'[ALERT] {msg}')
                     self._last_fuel_alert = now
 
             # Approaching pit window
-            if (laps_until_pit is not None
-                    and 0 < laps_until_pit <= 2
-                    and now - self._last_pit_alert > 60):
+            if laps_until_pit is not None and 0 < laps_until_pit <= 2:
                 msg = f"Approaching pit window. {laps_until_pit} laps to pit."
-                self.speak(msg)
-                self.log(f'[ALERT] {msg}')
-                self._last_pit_alert = now
+                if self._say('pit_window', msg, 60):
+                    self.log(f'[ALERT] {msg}')
+                    self._last_pit_alert = now
 
-            # Overdue
-            if (pit_status == 'red'
-                    and now - self._last_overdue_alert > 120):
+            if pit_status == 'red':
                 msg = "Overdue for pit stop. You are past the planned pit lap."
-                self.speak(msg)
-                self.log(f'[ALERT] {msg}')
-                self._last_overdue_alert = now
+                if self._say('pit_overdue', msg, 120):
+                    self.log(f'[ALERT] {msg}')
+                    self._last_overdue_alert = now
 
             # Weather / track evolution alerts
             weather = ctx.get('weather', {})
             wet_now     = weather.get('wet', False)
             wetness_now = weather.get('track_wetness', 0)
-            if wet_now != self._last_weather_declared_wet and now - self._last_weather_alert > 30:
+            if wet_now != self._last_weather_declared_wet:
                 msg = ("Session declared wet — wet tyres now permitted."
                        if wet_now else "Session changed to dry conditions.")
-                self.speak(msg)
-                self.log(f'[WEATHER] {msg}')
-                self._last_weather_declared_wet = wet_now
-                self._last_weather_alert = now
-            elif (wetness_now >= 4 and self._last_track_wetness < 4
-                  and now - self._last_weather_alert > 60):
+                if self._say('weather_declared_wet', msg, 30):
+                    self.log(f'[WEATHER] {msg}')
+                    self._last_weather_declared_wet = wet_now
+                    self._last_weather_alert = now
+            elif wetness_now >= 4 and self._last_track_wetness < 4:
                 msg = "Track conditions are getting wet. Consider your pit strategy."
-                self.speak(msg)
-                self.log(f'[WEATHER] {msg}')
-                self._last_track_wetness = wetness_now
-                self._last_weather_alert = now
+                if self._say('weather_wet', msg, 60):
+                    self.log(f'[WEATHER] {msg}')
+                    self._last_track_wetness = wetness_now
+                    self._last_weather_alert = now
             elif wetness_now < 2 and self._last_track_wetness >= 4:
                 self._last_track_wetness = wetness_now  # track has dried, reset silently
 
             # Blue flag alert
             flags    = ctx.get('session_flags', {})
             blue_now = flags.get('blue', False)
-            if blue_now and not self._prev_blue_flag and now - self._last_blue_flag_alert > 20:
+            if blue_now and not self._prev_blue_flag:
                 msg = "Blue flag. Let the leader through."
-                self.speak(msg)
-                self.log(f'[FLAG] {msg}')
-                self._last_blue_flag_alert = now
+                if self._say('flag_blue', msg, 20):
+                    self.log(f'[FLAG] {msg}')
+                    self._last_blue_flag_alert = now
             self._prev_blue_flag = blue_now
 
             gap_history = self._gap_history
@@ -2737,31 +2733,28 @@ class App(tk.Tk):
                     if behind_delta < -1.0 and b and 0 < b['gap'] < 20:
                         msg = (f"Car behind closing — {b['name']} is {b['gap']:.1f}s back "
                                f"and closing fast.")
-                        self.speak(msg)
-                        self.log(f'[GAP] {msg}')
-                        self._last_gap_alert = now
-                if len(ahead_hist) >= 5 and now - self._last_gap_alert > 45:
+                        if self._say('gap_closing_behind', msg, 45):
+                            self.log(f'[GAP] {msg}')
+                            self._last_gap_alert = now
+                if len(ahead_hist) >= 5:
                     ahead_delta = ahead_hist[-1] - ahead_hist[-5]
                     a = opp.get('ahead')
                     if ahead_delta < -1.0 and a and 0 < a['gap'] < 20:
                         msg = (f"Closing on P{a['position']} — {a['gap']:.1f}s gap, "
                                f"gaining fast.")
-                        self.speak(msg)
-                        self.log(f'[GAP] {msg}')
-                        self._last_gap_alert = now
+                        if self._say('gap_closing_ahead', msg, 45):
+                            self.log(f'[GAP] {msg}')
+                            self._last_gap_alert = now
 
             my_pos_now = tele.get('opponents', {}).get('my_position')
             if (my_pos_now is not None
                     and self._prev_position is not None
-                    and my_pos_now != self._prev_position
-                    and now - self._last_position_alert > 12):
-                if my_pos_now < self._prev_position:
-                    msg = f"Up to P{my_pos_now}."
-                else:
-                    msg = f"Down to P{my_pos_now}."
-                self.speak(msg)
-                self.log(f'[POS] {msg}')
-                self._last_position_alert = now
+                    and my_pos_now != self._prev_position):
+                word = "Up" if my_pos_now < self._prev_position else "Down"
+                msg = f"{word} to P{my_pos_now}."
+                if self._say(f'position_{my_pos_now}', msg, 12):
+                    self.log(f'[POS] {msg}')
+                    self._last_position_alert = now
             if my_pos_now is not None:
                 self._prev_position = my_pos_now
 
@@ -2786,9 +2779,9 @@ class App(tk.Tk):
                                 msg += " Should make the window on save."
                             else:
                                 msg += " May need to pit earlier."
-                    self.speak(msg)
-                    self.log(f'[FUEL] {msg}')
-                    self._last_fuel_diverge_alert = now
+                    if self._say('fuel_diverge', msg, 300):
+                        self.log(f'[FUEL] {msg}')
+                        self._last_fuel_diverge_alert = now
 
             current_stint = live.get('current_stint', {})
             next_stint    = live.get('next_stint', {})
@@ -2799,14 +2792,14 @@ class App(tk.Tk):
                     and now - self._last_driver_swap_alert > 120):
                 next_driver = next_stint.get('driver_name', 'next driver')
                 msg = f"Driver change in {laps_until_pit} laps. Get {next_driver} ready."
-                self.speak(msg)
-                self.log(f'[SWAP] {msg}')
-                self._last_driver_swap_alert = now
+                if self._say('driver_swap', msg, 120):
+                    self.log(f'[SWAP] {msg}')
+                    self._last_driver_swap_alert = now
 
             incidents_now = tele.get('incidents', 0)
             if incidents_now > self._prev_incidents:
                 msg = f"Incident! You're now on {incidents_now} incident point{'s' if incidents_now != 1 else ''}."
-                if self._callout_mgr and self._callout_mgr.submit('incident', msg, cooldown_s=30):
+                if self._say(f'incident_{incidents_now}', msg, 0):
                     self.log(f'[INCIDENT] {msg}')
                     self._last_incident_alert = now
             self._prev_incidents = max(self._prev_incidents, incidents_now)
@@ -3171,6 +3164,14 @@ class App(tk.Tk):
         except (TypeError, ValueError):
             race_hrs_fmt = f"{race_hrs}h"
 
+        # Build fuel line — never mix measured and plan-estimated values in the same line
+        _cap = plan.get('fuel_capacity_l')
+        _pct_str = f" | {round(fuel_sensor_l / _cap * 100)}%" if (fuel_sensor_l and _cap) else ""
+        if sensor_laps is not None:
+            _fuel_line = f"FUEL: {fuel_disp} remaining | {sensor_laps:.1f} laps (measured){_pct_str}"
+        else:
+            _fuel_line = f"FUEL: {fuel_disp} remaining | laps remaining: unknown (fuel burn not yet measured)"
+
         if live.get('status') == 'finished':
             lines += [
                 f"RACE: {plan.get('name', 'Unknown')} | Duration: {race_hrs_fmt}",
@@ -3181,10 +3182,7 @@ class App(tk.Tk):
                 f"RACE: {plan.get('name', 'Unknown')} | Duration: {race_hrs_fmt}",
                 f"LAP: {live.get('current_lap', '?')} | DRIVER: {cs.get('driver_name', '?')} "
                 f"| STINT: {cs.get('stint_num', '?')} of {plan.get('total_stints', '?')}",
-                f"FUEL: {fuel_disp} remaining | "
-                f"{safe_float(sensor_laps if sensor_laps is not None else live.get('laps_of_fuel'))} laps"
-                f"{' (measured)' if sensor_laps is not None else ' (plan est.)'}"
-                f" | {(round(fuel_sensor_l / plan.get('fuel_capacity_l', fuel_sensor_l) * 100) if fuel_sensor_l and plan.get('fuel_capacity_l') else live.get('fuel_pct', '?'))}%",
+                _fuel_line,
                 f"PIT WINDOW: lap {live.get('pit_window_optimal', '?')} "
                 f"(last safe: {live.get('pit_window_last', '?')}) | "
                 f"{live.get('laps_until_pit', '?')} laps away | "
@@ -3393,11 +3391,11 @@ class App(tk.Tk):
         # Speak the lap time immediately so the driver hears it without network delay
         spoken_time = self._fmt_lap_spoken(lap_time)
         if is_pb:
-            self.speak(f"Lap {lap_num}, {spoken_time}. New session best.")
+            self._say(f'lap_{lap_num}', f"Lap {lap_num}, {spoken_time}. New session best.", 0)
         elif is_slow:
-            self.speak(f"Lap {lap_num}, {spoken_time}.")
+            self._say(f'lap_{lap_num}', f"Lap {lap_num}, {spoken_time}.", 0)
         else:
-            self.speak(f"Lap {lap_num} check-in, {spoken_time}.")
+            self._say(f'lap_{lap_num}', f"Lap {lap_num} check-in, {spoken_time}.", 0)
 
         # Skip if a coaching request is already in flight — prevents API pile-up
         if self._coaching_in_flight:
@@ -3535,6 +3533,13 @@ class App(tk.Tk):
             self._tts_queue.put_nowait(text)
         except queue.Full:
             pass
+
+    def _say(self, key: str, msg: str, cooldown_s: float = 0.0) -> bool:
+        """Route a callout through CalloutManager for dedup, falling back to direct speak."""
+        if self._callout_mgr:
+            return self._callout_mgr.submit(key, msg, cooldown_s)
+        self.speak(msg)
+        return True
 
     def _tts_worker(self):
         """Single persistent TTS thread — processes one utterance at a time."""
