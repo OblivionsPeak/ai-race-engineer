@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.21"
+VERSION     = "1.1.22"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -858,6 +858,8 @@ class App(tk.Tk):
         self._total_laps_this_session: int = 0
         self._coaching_in_flight: bool = False
         self._last_strategy_lap: int = 0
+        self._last_pit_briefed_stint: int = 0
+        self._last_fuel_save_lap: int = 0
         self._track_history: dict = {}
         self._prev_session_type: str = ''
         self._session_debrief_triggered: bool = False
@@ -2478,6 +2480,94 @@ class App(tk.Tk):
 
         threading.Thread(target=_do, daemon=True).start()
 
+    def _speak_pit_briefing(self, live: dict, tele: dict):
+        """Speak the pre-pit briefing on the pit lap — deterministic, no AI query."""
+        cs  = live.get('current_stint', {})
+        ns  = live.get('next_stint',    {})
+        opp = tele.get('opponents',     {})
+        my_pos = opp.get('my_position')
+
+        imperial = self._cfg.get('fuel_unit', 'gal') == 'gal'
+
+        def _fmt_fuel(l):
+            if l is None: return None
+            return f"{l / 3.78541:.1f} gallons" if imperial else f"{l:.1f} litres"
+
+        parts = ["Box this lap."]
+
+        # Services for this stop — infer from plan
+        if not ns or ns.get('is_last'):
+            parts.append("Final stop.")
+        else:
+            next_driver  = ns.get('driver_name',  '')
+            curr_driver  = cs.get('driver_name',  '')
+            fuel_load    = ns.get('fuel_load')
+            fuel_str     = _fmt_fuel(fuel_load)
+
+            if next_driver and next_driver != curr_driver:
+                parts.append(f"Driver change — {next_driver} gets in.")
+            if fuel_str:
+                parts.append(f"Taking {fuel_str}.")
+
+        if my_pos:
+            parts.append(f"Currently P{my_pos}.")
+
+        msg = ' '.join(parts)
+        self._say('pit_briefing', msg, 30)
+        self.log(f'[PIT BRIEF] {msg}')
+
+    def _ask_fuel_save_coaching(self, current_fpl: float, target_fpl: float,
+                                 laps_to_save: int, fuel_remaining: float):
+        """Ask the AI for specific fuel-save driving advice. Fire-and-forget."""
+        if self._coaching_in_flight:
+            return
+        token = self._cfg.get('token', '')
+        if not token:
+            return
+        with self._ctx_lock:
+            ctx = self._ctx
+        if not ctx:
+            return
+
+        reduction_pct = round((current_fpl - target_fpl) / current_fpl * 100)
+        imperial      = self._cfg.get('fuel_unit', 'gal') == 'gal'
+
+        def _fmt(l):
+            return f"{l/3.78541:.2f}gal" if imperial else f"{l:.2f}L"
+
+        system_prompt = self._build_system_prompt(ctx)
+        question = (
+            f"FUEL SAVE REQUIRED: currently burning {_fmt(current_fpl)}/lap, "
+            f"need {_fmt(target_fpl)}/lap ({reduction_pct}% less) to make {laps_to_save} more laps "
+            f"on {_fmt(fuel_remaining)} remaining. "
+            f"Give 2 specific driving technique changes to hit the target — reference actual corners "
+            f"on this track if known. Be direct and actionable, no more than 3 sentences."
+        )
+
+        self.log(f'[FUEL SAVE] Coaching requested: {_fmt(current_fpl)}/lap → {_fmt(target_fpl)}/lap')
+        self._coaching_in_flight = True
+
+        def _do():
+            try:
+                r = requests.post(
+                    f'{BACKEND_URL}/engineer/coaching',
+                    json={'token': token, 'system_prompt': system_prompt,
+                          'question': question},
+                    timeout=12,
+                )
+                if r.ok:
+                    answer = r.json().get('answer', '')
+                    if answer:
+                        self.log(f'[FUEL SAVE] {answer}')
+                        self.after(0, lambda: self._append_qa('[Fuel save] How do I save fuel?', answer))
+                        self.speak(answer)
+            except Exception as e:
+                self.log(f'Fuel save coaching error: {e}')
+            finally:
+                self._coaching_in_flight = False
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def _on_pit_stop_complete(self, duration: float, fuel_added: float, sv_flags: int):
         """Called on main thread when player exits pit road."""
         services = []
@@ -2594,6 +2684,8 @@ class App(tk.Tk):
         self._last_handling_coached_lap  = 0
         self._total_laps_this_session    = 0
         self._last_strategy_lap          = 0
+        self._last_pit_briefed_stint     = 0
+        self._last_fuel_save_lap         = 0
         self._session_best_lap           = 0.0
         self._lap_times_this_session     = []
         self._session_started            = False
@@ -2814,9 +2906,11 @@ class App(tk.Tk):
             else:
                 laps_of_fuel = live.get('laps_of_fuel')
 
-            laps_until_pit = live.get('laps_until_pit')
-            pit_status     = live.get('pit_window_status', '')
-            pit_optimal    = live.get('pit_window_optimal', '?')
+            laps_until_pit  = live.get('laps_until_pit')
+            pit_status      = live.get('pit_window_status', '')
+            pit_optimal     = live.get('pit_window_optimal', '?')
+            current_lap_now = tele.get('current_lap', 0) or 0
+            sess_type_now   = ctx.get('session', {}).get('type', '')
 
             # Fuel warning — only fire when we have 3+ measured laps to avoid plan-estimate false alarms
             fuel_laps_measured = tele.get('fuel_laps_measured', 0)
@@ -2838,9 +2932,33 @@ class App(tk.Tk):
                     self.log(f'[ALERT] {msg}')
                     self._last_pit_alert = now
 
+            # Pre-pit briefing — fires once on the pit lap itself
+            current_stint_num = live.get('current_stint', {}).get('stint_num', 0) or 0
+            if (laps_until_pit is not None and laps_until_pit <= 0
+                    and pit_status != 'red'
+                    and current_stint_num > self._last_pit_briefed_stint
+                    and not tele.get('on_pit_road')):
+                self._last_pit_briefed_stint = current_stint_num
+                self._speak_pit_briefing(live, tele)
+
+            # Fuel save coaching — fires when driver won't make pit window on current burn
+            if (fuel_laps_measured >= 3
+                    and laps_until_pit is not None and laps_until_pit > 0
+                    and laps_of_fuel is not None
+                    and avg_fpl and fuel_sensor
+                    and laps_of_fuel < laps_until_pit
+                    and current_lap_now > self._last_fuel_save_lap + 5
+                    and not self._coaching_in_flight):
+                target_fpl = fuel_sensor / laps_until_pit
+                if target_fpl > 0 and (avg_fpl - target_fpl) / avg_fpl > 0.05:
+                    self._last_fuel_save_lap = current_lap_now
+                    threading.Thread(
+                        target=self._ask_fuel_save_coaching,
+                        args=(avg_fpl, target_fpl, laps_until_pit, fuel_sensor),
+                        daemon=True,
+                    ).start()
+
             # Proactive pit strategy — fires once when window opens (laps_until_pit == 0 or 1)
-            current_lap_now = ctx.get('telemetry', {}).get('current_lap', 0) or 0
-            sess_type_now   = ctx.get('session', {}).get('type', '')
             if (pit_status in ('open', 'green')
                     and laps_until_pit is not None and laps_until_pit <= 1
                     and sess_type_now.lower() in ('race', 'feature race', 'heat race', 'lone qualify')
@@ -3177,11 +3295,30 @@ class App(tk.Tk):
                 self.after(0, self._reset_talk_label)
                 return
             self.log(f'You: "{question}"')
-            # Route pit-strategy questions to the focused strategy prompt
+            # Route pit-strategy and fuel-save questions to focused handlers
             _ql = question.lower()
-            _pit_keywords = ('pit', 'box', 'stop', 'stay out', 'extend')
+            _pit_keywords    = ('pit', 'box', 'stop', 'stay out', 'extend')
             _strategy_intent = ('should', 'when', 'now', 'this lap', 'strategy', 'call')
-            if (any(k in _ql for k in _pit_keywords)
+            _save_keywords   = ('save fuel', 'fuel save', 'saving fuel', 'how much fuel',
+                                 'make it', 'make the window', 'stretch')
+            if any(k in _ql for k in _save_keywords):
+                with self._ctx_lock:
+                    _ctx_s = self._ctx
+                _tele_s = (_ctx_s or {}).get('telemetry', {})
+                _live_s = (_ctx_s or {}).get('live', {})
+                _fpl_s  = _tele_s.get('fuel_delta', {}).get('avg_actual_fpl')
+                _fuel_s = _tele_s.get('fuel_level')
+                _ltp_s  = _live_s.get('laps_until_pit')
+                if _fpl_s and _fuel_s and _ltp_s and _ltp_s > 0:
+                    _target = _fuel_s / _ltp_s
+                    threading.Thread(
+                        target=self._ask_fuel_save_coaching,
+                        args=(_fpl_s, _target, _ltp_s, _fuel_s),
+                        daemon=True,
+                    ).start()
+                else:
+                    self._ask_engineer(question)
+            elif (any(k in _ql for k in _pit_keywords)
                     and any(k in _ql for k in _strategy_intent)):
                 threading.Thread(
                     target=self._ask_pit_strategy, args=('driver_voice',), daemon=True
