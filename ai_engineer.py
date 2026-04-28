@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.20"
+VERSION     = "1.1.21"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -491,6 +491,7 @@ class TelemetryThread(threading.Thread):
                 track_wetness  = int(ir['TrackWetness']                    or 0)
                 session_flags  = int(ir['SessionFlags']                    or 0)
                 player_on_pit  = bool(ir['OnPitRoad']                      or False)
+                is_on_track    = bool(ir['IsOnTrack']                      or False)
                 pit_sv_flags   = int(ir['PitSvFlags']                      or 0)
                 throttle_in    = float(ir['Throttle']                      or 0.0)
                 brake_in       = float(ir['Brake']                         or 0.0)
@@ -656,13 +657,15 @@ class TelemetryThread(threading.Thread):
                     'live': live,
                     'telemetry': {
                         'current_lap':        current_lap,
-                        'fuel_level':         round(fuel, 3),
+                        'fuel_level':         round(fuel, 3) if fuel is not None else None,
                         'last_lap_time_s':    round(lap_last, 3) if lap_last > 0 else None,
                         'session_time_s':     round(session_time, 1),
                         'fuel_delta':         fuel_delta,
                         'fuel_laps_measured': len(fuel_history),
                         'opponents':          opponents,
                         'incidents':          incidents,
+                        'on_pit_road':        player_on_pit,
+                        'is_on_track':        is_on_track,
                         'stale':              False,
                     },
                     'session': {
@@ -854,6 +857,8 @@ class App(tk.Tk):
         self._last_handling_coached_lap: int = 0
         self._total_laps_this_session: int = 0
         self._coaching_in_flight: bool = False
+        self._last_strategy_lap: int = 0
+        self._track_history: dict = {}
         self._prev_session_type: str = ''
         self._session_debrief_triggered: bool = False
         self._lap_sector_deltas: dict = {}
@@ -2156,6 +2161,55 @@ class App(tk.Tk):
             except Exception:
                 pass
         threading.Thread(target=_do, daemon=True).start()
+        # Fetch track/car history in parallel so AI has context from first lap
+        if track_name:
+            threading.Thread(
+                target=self._load_track_history,
+                args=(track_name, car_name),
+                daemon=True,
+            ).start()
+
+    def _load_track_history(self, track_name: str, car_name: str):
+        """Fetch aggregate stats for this track+car and store for system prompt injection."""
+        token = self._cfg.get('token', '')
+        if not token:
+            return
+        try:
+            r = requests.get(
+                f'{BACKEND_URL}/engineer/track-stats',
+                params={'token': token, 'track': track_name, 'car': car_name},
+                timeout=8,
+            )
+            if not r.ok:
+                return
+            data = r.json()
+            if not data.get('found') or not data.get('session_count'):
+                self.log(f'[HISTORY] No previous sessions at {track_name}.')
+                return
+            n       = data['session_count']
+            best    = data.get('best_lap_s')
+            avg_fpl = data.get('avg_fpl_l')
+            laps    = data.get('total_laps', 0)
+            last    = data.get('last_session_date', '')
+            self._track_history = data
+            parts = [f"{n} previous session{'s' if n != 1 else ''} at this track/car"]
+            if best:
+                m, s = divmod(best, 60)
+                parts.append(f"personal best {int(m)}:{s:06.3f}")
+            if avg_fpl:
+                parts.append(f"typical fuel burn {avg_fpl:.3f}L/lap")
+            if laps:
+                parts.append(f"{laps} laps logged")
+            if last:
+                parts.append(f"last raced {last}")
+            summary = f"YOUR HISTORY HERE: {', '.join(parts)}."
+            self._session_memory_summary = (
+                (self._session_memory_summary + '\n' if self._session_memory_summary else '')
+                + summary
+            )
+            self.log(f'[HISTORY] Track history loaded: {summary}')
+        except Exception as e:
+            self.log(f'[HISTORY] Track stats error: {e}')
 
     def _record_server_lap(self, lap_num: int, lap_time_s: float,
                             fuel_used_l: float | None, position: int | None):
@@ -2332,6 +2386,98 @@ class App(tk.Tk):
         finally:
             self._coaching_in_flight = False
 
+    def _ask_pit_strategy(self, trigger: str = 'driver_request'):
+        """Ask the AI for a single pit-now-or-stay-out recommendation. Fire-and-forget."""
+        if self._coaching_in_flight:
+            return
+        token = self._cfg.get('token', '')
+        if not token:
+            return
+        with self._ctx_lock:
+            ctx = self._ctx
+        if not ctx:
+            return
+
+        live  = ctx.get('live', {})
+        tele  = ctx.get('telemetry', {})
+        plan  = ctx.get('plan', {})
+        units = self._cfg.get('fuel_unit', 'gal')
+        imp   = (units == 'gal')
+
+        def _fmt(l):
+            if l is None: return '?'
+            return f"{l/3.78541:.2f}gal" if imp else f"{l:.1f}L"
+
+        fuel_sensor    = tele.get('fuel_level')
+        avg_fpl        = tele.get('fuel_delta', {}).get('avg_actual_fpl')
+        fuel_measured  = tele.get('fuel_laps_measured', 0)
+        sensor_laps    = round(fuel_sensor / avg_fpl, 1) if (fuel_sensor and avg_fpl) else None
+        laps_until_pit = live.get('laps_until_pit', '?')
+        pit_optimal    = live.get('pit_window_optimal', '?')
+        pit_last       = live.get('pit_window_last', '?')
+        pit_status     = live.get('pit_window_status', 'unknown').upper()
+        opp            = tele.get('opponents', {})
+        ahead          = opp.get('ahead')
+        behind         = opp.get('behind')
+        my_pos         = opp.get('my_position', '?')
+        current_lap    = tele.get('current_lap', '?')
+
+        gap_ahead_str  = f"{ahead['name']} {ahead['gap']:.1f}s ahead" if ahead else "clear ahead"
+        gap_behind_str = f"{behind['name']} {behind['gap']:.1f}s behind" if behind else "clear behind"
+
+        if sensor_laps is not None:
+            fuel_str = f"{_fmt(fuel_sensor)} | {sensor_laps} laps remaining (measured over {fuel_measured} laps)"
+        else:
+            fuel_str = f"{_fmt(fuel_sensor)} | laps remaining unknown (still measuring fuel burn)"
+
+        recent_stops = []
+        for entry in self._pit_stop_log[-2:]:
+            recent_stops.append(f"{entry['duration_s']:.1f}s stop ({'+'.join(entry['services']) or 'unknown services'})")
+        stops_str = '; '.join(recent_stops) if recent_stops else 'none this session'
+
+        situation = (
+            f"LAP: {current_lap} | POSITION: P{my_pos}\n"
+            f"GAP: {gap_ahead_str} | {gap_behind_str}\n"
+            f"PIT WINDOW: optimal lap {pit_optimal}, last safe lap {pit_last}, "
+            f"{laps_until_pit} laps away, status {pit_status}\n"
+            f"FUEL: {fuel_str}\n"
+            f"RECENT PIT STOPS THIS SESSION: {stops_str}"
+        )
+        question = (
+            "Should I pit this lap, extend my stint, or is there no strategic advantage either way? "
+            "Give one clear recommendation ('Pit this lap', 'Extend N more laps', or 'No change') "
+            "and one sentence of reasoning. Maximum 2 sentences."
+        )
+        system = (
+            "You are a professional endurance race engineer giving a real-time pit strategy call. "
+            "The driver needs a single decisive recommendation right now — no hedging, no multiple options. "
+            "Format: recommendation on one line, reasoning on the next. Max 2 sentences total."
+        )
+
+        self.log(f'[STRATEGY] Pit strategy requested ({trigger})')
+        self._coaching_in_flight = True
+
+        def _do():
+            try:
+                r = requests.post(
+                    f'{BACKEND_URL}/engineer/coaching',
+                    json={'token': token, 'system_prompt': system,
+                          'question': f"{situation}\n\n{question}"},
+                    timeout=12,
+                )
+                if r.ok:
+                    answer = r.json().get('answer', '')
+                    if answer:
+                        self.log(f'[STRATEGY] {answer}')
+                        self.after(0, lambda: self._append_qa('[Strategy] Pit call?', answer))
+                        self.speak(answer)
+            except Exception as e:
+                self.log(f'Pit strategy error: {e}')
+            finally:
+                self._coaching_in_flight = False
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def _on_pit_stop_complete(self, duration: float, fuel_added: float, sv_flags: int):
         """Called on main thread when player exits pit road."""
         services = []
@@ -2447,6 +2593,7 @@ class App(tk.Tk):
         self._last_coached_lap           = 0
         self._last_handling_coached_lap  = 0
         self._total_laps_this_session    = 0
+        self._last_strategy_lap          = 0
         self._session_best_lap           = 0.0
         self._lap_times_this_session     = []
         self._session_started            = False
@@ -2646,11 +2793,16 @@ class App(tk.Tk):
                 ctx = self._ctx
             if not ctx:
                 continue
-            if ctx.get('telemetry', {}).get('stale'):
+            tele_chk = ctx.get('telemetry', {})
+            if tele_chk.get('stale'):
+                continue
+            # Suppress all proactive alerts when driver is not actively on track
+            # (covers: sitting in pit box, spectating, garage, replay)
+            if not tele_chk.get('is_on_track', True):
                 continue
 
             live      = ctx.get('live', {})
-            tele      = ctx.get('telemetry', {})
+            tele      = tele_chk
             now       = time.time()
             warn_laps = self._cfg.get('fuel_warning_laps', DEFAULTS['fuel_warning_laps'])
 
@@ -2679,12 +2831,25 @@ class App(tk.Tk):
                     self.log(f'[ALERT] {msg}')
                     self._last_fuel_alert = now
 
-            # Approaching pit window
+            # Approaching pit window — speak alert then fire strategy call
             if laps_until_pit is not None and 0 < laps_until_pit <= 2:
                 msg = f"Approaching pit window. {laps_until_pit} laps to pit."
                 if self._say('pit_window', msg, 60):
                     self.log(f'[ALERT] {msg}')
                     self._last_pit_alert = now
+
+            # Proactive pit strategy — fires once when window opens (laps_until_pit == 0 or 1)
+            current_lap_now = ctx.get('telemetry', {}).get('current_lap', 0) or 0
+            sess_type_now   = ctx.get('session', {}).get('type', '')
+            if (pit_status in ('open', 'green')
+                    and laps_until_pit is not None and laps_until_pit <= 1
+                    and sess_type_now.lower() in ('race', 'feature race', 'heat race', 'lone qualify')
+                    and current_lap_now > self._last_strategy_lap + 3
+                    and not self._coaching_in_flight):
+                self._last_strategy_lap = current_lap_now
+                threading.Thread(
+                    target=self._ask_pit_strategy, args=('pit_window_opened',), daemon=True
+                ).start()
 
             if pit_status == 'red':
                 msg = "Overdue for pit stop. You are past the planned pit lap."
@@ -3012,7 +3177,17 @@ class App(tk.Tk):
                 self.after(0, self._reset_talk_label)
                 return
             self.log(f'You: "{question}"')
-            self._ask_engineer(question)
+            # Route pit-strategy questions to the focused strategy prompt
+            _ql = question.lower()
+            _pit_keywords = ('pit', 'box', 'stop', 'stay out', 'extend')
+            _strategy_intent = ('should', 'when', 'now', 'this lap', 'strategy', 'call')
+            if (any(k in _ql for k in _pit_keywords)
+                    and any(k in _ql for k in _strategy_intent)):
+                threading.Thread(
+                    target=self._ask_pit_strategy, args=('driver_voice',), daemon=True
+                ).start()
+            else:
+                self._ask_engineer(question)
         except Exception as e:
             self.log(f'Voice error: {e}')
             self.after(0, self._reset_talk_label)
