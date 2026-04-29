@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.25"
+VERSION     = "1.1.26"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -836,8 +836,11 @@ def _apply_update(new_exe_path: str):
         f')\n'
         f'move /y "{new_exe_path}" "{current_exe}"\n'
         f'del /f /q "{exe_dir}\\_nrp_update_*.exe" 2>nul\n'
-        f'timeout /t 4 /nobreak >nul\n'
-        f'start "" "{current_exe}"\n'
+        # Give Windows Defender time to finish scanning the replaced EXE before launching
+        f'timeout /t 8 /nobreak >nul\n'
+        # PowerShell Start-Process is more reliable than cmd start for launching
+        # freshly written EXEs — cmd start can silently fail if Defender is still scanning
+        f'powershell -Command "Start-Process \'{current_exe}\'"\n'
         'del "%~f0"\n'
     )
     with open(bat_path, 'w') as f:
@@ -1348,7 +1351,7 @@ class App(tk.Tk):
                  font=('Segoe UI', 13, 'bold')).pack(pady=(22, 4))
         tk.Label(dlg, text=f'Version {tag} is ready.  You have v{VERSION}.',
                  bg=BG, fg=DIM, font=('Segoe UI', 9)).pack()
-        tk.Label(dlg, text='The app will restart automatically after downloading.',
+        tk.Label(dlg, text='The app will close, update, and relaunch automatically.',
                  bg=BG, fg=DIM, font=('Segoe UI', 9)).pack(pady=(2, 14))
 
         progress_var = tk.DoubleVar(value=0)
