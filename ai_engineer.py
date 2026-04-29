@@ -166,6 +166,8 @@ DEFAULTS = {
     'units_system':      'metric',
     'checkin_laps':      5,
     'tts_rate':          1.0,
+    'listen_mode':       'ptt',   # 'ptt' or 'vad'
+    'vad_sensitivity':   0.02,    # RMS threshold for voice activity detection
 }
 
 def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
@@ -498,6 +500,23 @@ class TelemetryThread(threading.Thread):
                 lat_accel_in   = float(ir['LatAccel']                      or 0.0)
                 yaw_rate_in    = float(ir['YawRate']                       or 0.0)
                 speed_ms_in    = float(ir['Speed']                         or 0.0)
+                steering_in    = float(ir['SteeringWheelAngle']            or 0.0)
+                gear_in        = int(ir['Gear']                            or 0)
+                rpm_in         = float(ir['RPM']                           or 0.0)
+                steer_max      = float(ir['SteeringWheelAngleMax']         or 3.14)
+
+                # Build and queue a pit-wall telemetry frame (20 fps throttle handled in broadcast thread)
+                self._app._tele_frame = {
+                    't': round(throttle_in, 3),
+                    'b': round(brake_in, 3),
+                    's': round(steering_in / max(steer_max, 0.01), 3),  # normalise to -1..1
+                    'v': round(speed_ms_in, 1),
+                    'g': gear_in,
+                    'r': int(rpm_in),
+                    'p': round(lap_dist_pct, 4),
+                    'l': current_lap,
+                    'ts': round(session_time, 2),
+                }
 
                 # Fire deferred lap-complete — wait 2 ticks so LapLastLapTime has time to update
                 if pending_lap_complete is not None:
@@ -877,6 +896,12 @@ class App(tk.Tk):
         self._prev_incidents: int = 0
         self._last_incident_alert: float = 0.0
         self._alert_gen: int = 0
+        self._vad_thread: threading.Thread | None = None
+        # Pit wall broadcast state
+        self._tele_frame: dict = {}
+        self._tele_lap_buf: list = []   # frames accumulated for the current lap
+        self._tele_best_lap_s: float = 0.0
+        self._broadcast_thread: threading.Thread | None = None
         self._last_gap_alert: float = 0.0
         self._last_fuel_diverge_alert: float = 0.0
         self._last_position_alert: float = 0.0
@@ -940,6 +965,9 @@ class App(tk.Tk):
         _ci_raw = self._cfg.get('checkin_laps', 5)
         self.v_checkin_laps = tk.StringVar(value='never' if not _ci_raw else str(_ci_raw))
         self.v_tts_rate = tk.DoubleVar(value=self._cfg.get('tts_rate', 1.0))
+        self.v_listen_mode = tk.StringVar(value=self._cfg.get('listen_mode', 'ptt'))
+        self.v_vad_sensitivity = tk.DoubleVar(
+            value=self._cfg.get('vad_sensitivity', DEFAULTS['vad_sensitivity']))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue(maxsize=5)
@@ -1154,6 +1182,32 @@ class App(tk.Tk):
                                     bg=BG2, fg=TEXT, font=('Segoe UI', 9), width=4)
         self._rate_label.pack(side='left', padx=(6, 0))
 
+        # Row 12: Listen Mode (PTT vs Always-On)
+        ttk.Label(frm, text='Listen Mode').grid(row=12, column=0, sticky='w', pady=3, padx=(0, 10))
+        listen_cb = ttk.Combobox(frm, textvariable=self.v_listen_mode,
+                                 values=['ptt', 'vad'], state='readonly', width=12)
+        listen_cb.grid(row=12, column=1, sticky='w', pady=3)
+        listen_cb.bind('<<ComboboxSelected>>', lambda _: self._save_listen_mode_pref())
+        tk.Label(frm, text='ptt = hold button  |  vad = always listening',
+                 bg=BG2, fg=DIM, font=('Segoe UI', 8),
+                 ).grid(row=12, column=2, sticky='w', pady=3, padx=(6, 0))
+
+        # Row 13: VAD Sensitivity (only meaningful in vad mode)
+        ttk.Label(frm, text='VAD Sensitivity').grid(row=13, column=0, sticky='w', pady=3, padx=(0, 10))
+        vad_frame = ttk.Frame(frm)
+        vad_frame.grid(row=13, column=1, sticky='ew', pady=3, columnspan=2)
+        tk.Scale(
+            vad_frame, variable=self.v_vad_sensitivity,
+            from_=0.005, to=0.10, resolution=0.005, orient='horizontal',
+            bg=BG2, fg=TEXT, troughcolor=BG3, highlightthickness=0,
+            activebackground=ACCENT, length=180, showvalue=False,
+            command=lambda _: self._save_vad_sensitivity_pref(),
+        ).pack(side='left')
+        self._vad_sens_label = tk.Label(vad_frame,
+                                        text=f'{self.v_vad_sensitivity.get():.3f}',
+                                        bg=BG2, fg=TEXT, font=('Segoe UI', 9), width=5)
+        self._vad_sens_label.pack(side='left', padx=(6, 0))
+
     def _save_fuel_unit_pref(self):
         self._cfg['fuel_unit'] = self.v_fuel_unit.get()
         save_config(self._cfg)
@@ -1192,6 +1246,31 @@ class App(tk.Tk):
         self._cfg['tts_rate'] = rate
         self._rate_label.config(text=f'{rate:.1f}x')
         save_config(self._cfg)
+
+    def _save_listen_mode_pref(self):
+        self._cfg['listen_mode'] = self.v_listen_mode.get()
+        save_config(self._cfg)
+
+    def _save_vad_sensitivity_pref(self):
+        val = self.v_vad_sensitivity.get()
+        self._cfg['vad_sensitivity'] = val
+        self._vad_sens_label.config(text=f'{val:.3f}')
+        save_config(self._cfg)
+
+    def _update_pitwall_btn(self):
+        if self._server_session_id:
+            self.pitwall_btn.pack(side='left')
+            self.v_pitwall_status.set(f'Session {self._server_session_id} — share with teammates')
+
+    def _copy_pitwall_link(self):
+        if not self._server_session_id:
+            return
+        url = f'{BACKEND_URL}/engineer/pitwall/{self._server_session_id}'
+        self.clipboard_clear()
+        self.clipboard_append(url)
+        self.v_pitwall_status.set('Link copied!')
+        self.after(3000, lambda: self.v_pitwall_status.set(
+            f'Session {self._server_session_id} — share with teammates'))
 
     def _check_for_update(self):
         """Run in a background thread. Prompts user if a newer release exists."""
@@ -1518,6 +1597,19 @@ class App(tk.Tk):
             pady=10,
         )
         self.talk_label.pack(fill='x')
+
+        # Pit wall share button (hidden until session starts)
+        pw_frame = ttk.Frame(self)
+        pw_frame.pack(fill='x', padx=14, pady=(0, 2))
+        self.pitwall_btn = ttk.Button(
+            pw_frame, text='Copy Pit Wall Link',
+            style='Browse.TButton', command=self._copy_pitwall_link,
+        )
+        self.pitwall_btn.pack(side='left')
+        self.v_pitwall_status = tk.StringVar(value='')
+        tk.Label(pw_frame, textvariable=self.v_pitwall_status,
+                 bg=BG2, fg=DIM, font=('Segoe UI', 8)).pack(side='left', padx=(8, 0))
+        self.pitwall_btn.pack_forget()  # hidden until session_id is set
 
         # Text fallback (hidden by default)
         self.text_input_frame = ttk.Frame(self)
@@ -2160,6 +2252,8 @@ class App(tk.Tk):
                 if r.ok:
                     self._server_session_id = r.json().get('session_id')
                     self.log(f'[HISTORY] Session {self._server_session_id} started.')
+                    self.after(0, self._start_broadcast)
+                    self.after(0, self._update_pitwall_btn)
             except Exception:
                 pass
         threading.Thread(target=_do, daemon=True).start()
@@ -2297,14 +2391,63 @@ class App(tk.Tk):
             if fd.get('avg_actual_fpl'):
                 avg_fpl_str = f"{fd['avg_actual_fpl']:.3f}L/lap"
 
+        # Sector averages across all laps with recorded data
+        sector_summary_str = ''
+        if self._lap_sector_deltas:
+            s_avgs = {}
+            for sx in ('s1', 's2', 's3'):
+                vals = [v[sx] for v in self._lap_sector_deltas.values() if sx in v]
+                if vals:
+                    s_avgs[sx] = sum(vals) / len(vals)
+            if s_avgs:
+                parts = [f"{sx.upper()}: {avg_d:+.3f}s avg vs best" for sx, avg_d in s_avgs.items()]
+                worst = max(s_avgs, key=lambda k: s_avgs[k])
+                sector_summary_str = (
+                    f" Session sector averages vs best: {', '.join(parts)}."
+                    f" Weakest sector overall: {worst.upper()}."
+                )
+
+        # Handling summary across all laps
+        handling_summary_str = ''
+        if self._per_lap_dynamics:
+            total_over  = sum(d.get('oversteer', 0)  for d in self._per_lap_dynamics.values())
+            total_under = sum(d.get('understeer', 0) for d in self._per_lap_dynamics.values())
+            n_laps_dyn  = len(self._per_lap_dynamics)
+            if total_over > total_under * 1.5 and total_over / n_laps_dyn > 3:
+                handling_summary_str = (
+                    f" Handling: consistent oversteer tendency across the session "
+                    f"({total_over} events over {n_laps_dyn} laps) — consider setup or brake bias adjustment."
+                )
+            elif total_under > total_over * 1.5 and total_under / n_laps_dyn > 3:
+                handling_summary_str = (
+                    f" Handling: consistent understeer tendency across the session "
+                    f"({total_under} events over {n_laps_dyn} laps) — consider setup or brake bias adjustment."
+                )
+
+        # Consistency across the session
+        consistency_summary_str = ''
+        if len(times) >= 4:
+            mean_t  = sum(times) / len(times)
+            std_dev = (sum((t - mean_t) ** 2 for t in times) / len(times)) ** 0.5
+            consistency_summary_str = f" Lap-to-lap consistency: ±{std_dev:.2f}s std dev."
+
+        track_name   = (ctx.get('plan', {}).get('track', '') or '') if ctx else ''
+        track_debrief_hint = (
+            f" Sectors are approximate thirds of the lap at {track_name} — "
+            f"name the relevant corners when discussing sector weaknesses."
+        ) if (track_name and sector_summary_str) else ''
+
         system_prompt = self._build_system_prompt(ctx) if ctx else ''
         question = (
-            f"Session complete — give a brief debrief. "
+            f"Session complete — give a debrief. "
             f"{total_laps} laps total. Best: {self._fmt_lap_spoken(best)}. "
             f"Avg (last {n}): {self._fmt_lap_spoken(avg)}. "
-            f"Pace trend: {trend_word} ({trend:+.2f}s first 5 vs last 5 of sample). "
+            f"Pace trend: {trend_word} ({trend:+.2f}s first 5 vs last 5 of sample)."
+            f"{sector_summary_str}{handling_summary_str}{consistency_summary_str}{track_debrief_hint} "
             f"Incidents: {incidents}. Stints: {stints_done}. Avg fuel: {avg_fpl_str}. "
-            f"Keep it to 3 sentences — one key takeaway and one thing to improve next time."
+            f"Give 3-4 sentences: one on overall pace, one on the weakest area to focus on "
+            f"next time (use sector and handling data to be specific), one on any setup or "
+            f"technique recommendation. Do not repeat the lap time."
         )
         self.log('[DEBRIEF] Generating session debrief…')
 
@@ -2716,21 +2859,28 @@ class App(tk.Tk):
         self._running = True
 
         # ── Show/hide voice vs text input ─────────────────────────────────
-        binding   = self._cfg.get('ptt_binding', DEFAULTS['ptt_binding'])
-        btn_label = _binding_label(binding)
+        binding     = self._cfg.get('ptt_binding', DEFAULTS['ptt_binding'])
+        btn_label   = _binding_label(binding)
+        listen_mode = self._cfg.get('listen_mode', 'ptt')
         if voice_ok:
-            self.talk_label.config(
-                fg=DIM, bg=BG, text=f'HOLD  {btn_label}  TO  TALK')
             self.text_input_frame.pack_forget()
-            if binding.get('type') == 'joystick':
-                self._start_joystick_listener(binding)
+            if listen_mode == 'vad':
+                self.talk_label.config(fg=DIM, bg=BG, text='● LISTENING…')
+                self._start_vad_listener()
             else:
-                self._start_keyboard_listener()
+                self.talk_label.config(fg=DIM, bg=BG, text=f'HOLD  {btn_label}  TO  TALK')
+                if binding.get('type') == 'joystick':
+                    self._start_joystick_listener(binding)
+                else:
+                    self._start_keyboard_listener()
         else:
             self.talk_label.config(fg=BORDER, bg=BG, text='VOICE UNAVAILABLE — USE TEXT INPUT BELOW')
             self.text_input_frame.pack(fill='x', padx=14, pady=2)
 
         # ── Start threads ─────────────────────────────────────────────────
+        self._tele_frame      = {}
+        self._tele_lap_buf    = []
+        self._tele_best_lap_s = 0.0
         self._callout_mgr = CalloutManager(self.speak, lambda msg: self.log(f'[CALLOUT] {msg}'))
         self._telemetry_thread = TelemetryThread(self)
         self._telemetry_thread.start()
@@ -2793,15 +2943,14 @@ class App(tk.Tk):
             self._callout_mgr = None
 
         self._stop_keyboard_listener()
+        self._stop_vad_listener()
+        self._stop_broadcast()
         self._joystick_thread = None  # daemon thread — exits when _stop_evt is set
 
         self.start_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         self.set_status('stopped')
-        binding   = self._cfg.get('ptt_binding', DEFAULTS['ptt_binding'])
-        btn_label = _binding_label(binding)
-        self.after(0, lambda: self.talk_label.config(
-            fg=DIM, bg=BG, text=f'HOLD  {btn_label}  TO  TALK'))
+        self.after(0, self._reset_talk_label)
         self.log('Engineer stopped.')
 
     # ── Stint panel refresh ───────────────────────────────────────────────────
@@ -3206,6 +3355,197 @@ class App(tk.Tk):
                 pass
             self._kb_listener = None
 
+    # ── VAD always-on listener ────────────────────────────────────────────────
+
+    def _start_vad_listener(self):
+        if not SD_AVAILABLE or not SCIPY_AVAILABLE:
+            self.log('VAD unavailable — sounddevice or scipy missing')
+            return
+        self._vad_thread = threading.Thread(target=self._vad_loop, daemon=True)
+        self._vad_thread.start()
+        self.log('Always-on VAD listener started.')
+
+    def _stop_vad_listener(self):
+        # Daemon thread exits automatically when _stop_evt fires; nothing explicit needed.
+        self._vad_thread = None
+
+    # ── Pit wall broadcast ────────────────────────────────────────────────────
+
+    def _start_broadcast(self):
+        if not self._server_session_id:
+            return
+        self._broadcast_thread = threading.Thread(target=self._broadcast_loop, daemon=True)
+        self._broadcast_thread.start()
+        self.log(f'Pit wall live at {BACKEND_URL}/engineer/pitwall/{self._server_session_id}')
+
+    def _stop_broadcast(self):
+        self._broadcast_thread = None  # daemon — exits with _stop_evt
+
+    def _broadcast_loop(self):
+        """Push one telemetry frame to the backend every 50 ms (20 fps)."""
+        token = self._cfg.get('token', '')
+        while not self._stop_evt.is_set() and self._running:
+            frame = self._tele_frame
+            sid   = self._server_session_id
+            if frame and sid and token:
+                with self._ctx_lock:
+                    ctx = self._ctx
+                meta = None
+                if ctx:
+                    meta = {
+                        'track':       ctx.get('plan', {}).get('track', ''),
+                        'car':         ctx.get('plan', {}).get('car', ''),
+                        'driver_name': self._display_name or '',
+                    }
+                try:
+                    requests.post(
+                        f'{BACKEND_URL}/engineer/telemetry/push',
+                        json={'token': token, 'session_id': sid, 'frame': frame,
+                              'meta': meta},
+                        timeout=2,
+                    )
+                except Exception:
+                    pass
+                # Accumulate frame in the current-lap buffer for ref-lap detection
+                if frame.get('p') is not None:
+                    self._tele_lap_buf.append(dict(frame))
+            time.sleep(0.05)
+
+    def _push_ref_lap(self, lap_time_s: float):
+        """Send the accumulated lap buffer as the reference lap if it's the session best."""
+        token = self._cfg.get('token', '')
+        sid   = self._server_session_id
+        if not token or not sid or not self._tele_lap_buf:
+            return
+        if self._tele_best_lap_s > 0 and lap_time_s >= self._tele_best_lap_s:
+            return  # not a new best — don't overwrite the reference
+        self._tele_best_lap_s = lap_time_s
+        frames = list(self._tele_lap_buf)
+        def _do():
+            try:
+                requests.post(
+                    f'{BACKEND_URL}/engineer/telemetry/ref_lap',
+                    json={'token': token, 'session_id': sid,
+                          'frames': frames, 'lap_time_s': lap_time_s},
+                    timeout=5,
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _push_qa_to_pitwall(self, question: str, answer: str):
+        """Forward a Q&A pair to the pit wall log."""
+        token = self._cfg.get('token', '')
+        sid   = self._server_session_id
+        if not token or not sid:
+            return
+        def _do():
+            try:
+                requests.post(
+                    f'{BACKEND_URL}/engineer/telemetry/qa',
+                    json={'token': token, 'session_id': sid,
+                          'question': question, 'answer': answer},
+                    timeout=3,
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _vad_loop(self):
+        """Continuously monitors the mic. When sustained speech is detected, records and
+        processes exactly like a PTT release — no external wake-word library required."""
+        SAMPLE_RATE   = 16000
+        CHUNK_FRAMES  = 1600            # 100 ms per chunk
+        MIN_SPEECH_S  = 0.6            # ignore blips shorter than this
+        MAX_RECORD_S  = 12.0           # safety cap — sends after 12 s even if speech continues
+        SILENCE_S     = 1.2            # stop recording after this much silence
+        silence_chunks = int(SILENCE_S * SAMPLE_RATE / CHUNK_FRAMES)
+        min_speech_chunks = int(MIN_SPEECH_S * SAMPLE_RATE / CHUNK_FRAMES)
+
+        # ── Noise-gate calibration: 1.5 s of ambient audio ────────────────
+        self.after(0, lambda: self.talk_label.config(
+            bg=BG3, fg=YELLOW, text='● CALIBRATING MIC…'))
+        calibration_chunks = []
+        try:
+            with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
+                                blocksize=CHUNK_FRAMES) as stream:
+                for _ in range(15):   # 15 × 100 ms = 1.5 s
+                    chunk, _ = stream.read(CHUNK_FRAMES)
+                    calibration_chunks.append(float(np.sqrt(np.mean(chunk ** 2))))
+        except Exception as e:
+            self.log(f'VAD calibration error: {e}')
+            self.after(0, lambda: self.talk_label.config(
+                bg=BG, fg=BORDER, text='VAD ERROR — CHECK MIC'))
+            return
+        ambient_rms = (sum(calibration_chunks) / len(calibration_chunks)) if calibration_chunks else 0.0
+        user_thresh = self._cfg.get('vad_sensitivity', DEFAULTS['vad_sensitivity'])
+        threshold   = max(ambient_rms * 3.0, user_thresh)
+        self.log(f'VAD calibrated: ambient RMS={ambient_rms:.4f}, threshold={threshold:.4f}')
+        self.after(0, lambda: self.talk_label.config(
+            bg=BG, fg=DIM, text='● LISTENING…'))
+
+        # ── Main detection loop ────────────────────────────────────────────
+        try:
+            with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32',
+                                blocksize=CHUNK_FRAMES) as stream:
+                while not self._stop_evt.is_set() and self._running:
+                    chunk, _ = stream.read(CHUNK_FRAMES)
+                    rms = float(np.sqrt(np.mean(chunk ** 2)))
+
+                    if rms < threshold:
+                        continue    # silence — keep waiting
+
+                    # Speech onset detected — collect until silence or max duration
+                    if self._recording or self._coaching_in_flight:
+                        continue    # busy — drop this onset
+                    self.after(0, lambda: self.talk_label.config(
+                        bg=ACCENT, fg='white', text='● LISTENING…'))
+                    audio_buf  = [chunk.copy()]
+                    silent_cnt = 0
+                    max_chunks = int(MAX_RECORD_S * SAMPLE_RATE / CHUNK_FRAMES)
+
+                    for _ in range(max_chunks):
+                        if self._stop_evt.is_set() or not self._running:
+                            break
+                        chunk, _ = stream.read(CHUNK_FRAMES)
+                        audio_buf.append(chunk.copy())
+                        rms = float(np.sqrt(np.mean(chunk ** 2)))
+                        if rms < threshold:
+                            silent_cnt += 1
+                            if silent_cnt >= silence_chunks:
+                                break
+                        else:
+                            silent_cnt = 0
+
+                    if len(audio_buf) < min_speech_chunks:
+                        # Too short — probably a door slam or engine burst
+                        self.after(0, lambda: self.talk_label.config(
+                            bg=BG, fg=DIM, text='● LISTENING…'))
+                        continue
+
+                    # Hand off to the normal voice processing pipeline
+                    audio = np.concatenate(audio_buf, axis=0).flatten()
+                    audio_int16 = (audio * 32767).astype(np.int16)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
+                        wav_path = tmp.name
+                    wavfile.write(wav_path, SAMPLE_RATE, audio_int16)
+
+                    self.after(0, lambda: self.talk_label.config(
+                        bg=BG3, fg=YELLOW, text='● PROCESSING…'))
+                    threading.Thread(
+                        target=self._process_voice, args=(wav_path,), daemon=True).start()
+
+                    # Wait until processing is done before listening again
+                    while not self._stop_evt.is_set() and self._recording:
+                        time.sleep(0.05)
+
+        except Exception as e:
+            self.log(f'VAD loop error: {e}')
+        finally:
+            if self._running:
+                self.after(0, lambda: self.talk_label.config(
+                    bg=BG, fg=BORDER, text='VAD STOPPED — CHECK MIC'))
+
     def _start_recording(self):
         if self._recording or not SD_AVAILABLE:
             return
@@ -3230,9 +3570,12 @@ class App(tk.Tk):
             self.after(0, self._reset_talk_label)
 
     def _reset_talk_label(self):
-        binding   = self._cfg.get('ptt_binding', DEFAULTS['ptt_binding'])
-        btn_label = _binding_label(binding)
-        self.talk_label.config(bg=BG, fg=DIM, text=f'HOLD  {btn_label}  TO  TALK')
+        if self._cfg.get('listen_mode', 'ptt') == 'vad':
+            self.talk_label.config(bg=BG, fg=DIM, text='● LISTENING…')
+        else:
+            binding   = self._cfg.get('ptt_binding', DEFAULTS['ptt_binding'])
+            btn_label = _binding_label(binding)
+            self.talk_label.config(bg=BG, fg=DIM, text=f'HOLD  {btn_label}  TO  TALK')
 
     def _stop_recording(self):
         if not self._recording:
@@ -3390,6 +3733,7 @@ class App(tk.Tk):
             ))
             self.after(0, lambda: self._append_qa(question, answer))
             self.speak(answer)
+            self._push_qa_to_pitwall(question, answer)
         except Exception as e:
             self.log(f'Engineer error: {e}')
         finally:
@@ -3667,6 +4011,11 @@ class App(tk.Tk):
 
         self._last_coached_lap = lap_num
 
+        # Push ref lap if this is a new session best; reset lap buffer for next lap
+        threading.Thread(
+            target=self._push_ref_lap, args=(lap_time,), daemon=True).start()
+        self._tele_lap_buf = []
+
         # Store sector deltas and dynamics for this lap
         if sector_deltas:
             self._lap_sector_deltas[lap_num] = sector_deltas
@@ -3733,18 +4082,58 @@ class App(tk.Tk):
         else:
             fpl_str = ''
 
-        # Sector delta string
+        # Sector delta string — current lap + 3-lap trend per sector
         sector_str = ''
         if sector_deltas:
             parts = []
-            if 's1' in sector_deltas:
-                parts.append(f"S1: {sector_deltas['s1']:+.3f}s vs best")
-            if 's2' in sector_deltas:
-                parts.append(f"S2: {sector_deltas['s2']:+.3f}s vs best")
-            if 's3' in sector_deltas:
-                parts.append(f"S3: {sector_deltas['s3']:+.3f}s vs best")
+            for sx in ('s1', 's2', 's3'):
+                if sx not in sector_deltas:
+                    continue
+                label = sx.upper()
+                cur   = sector_deltas[sx]
+                # Collect the same sector across the last 3 completed laps (excluding this one)
+                recent_sector = [
+                    self._lap_sector_deltas[ln][sx]
+                    for ln in sorted(self._lap_sector_deltas)
+                    if ln != lap_num and sx in self._lap_sector_deltas[ln]
+                ][-3:]
+                if len(recent_sector) >= 2:
+                    trend_avg = sum(recent_sector) / len(recent_sector)
+                    if cur > trend_avg + 0.05:
+                        trend = f', worse than recent avg ({trend_avg:+.3f}s)'
+                    elif cur < trend_avg - 0.05:
+                        trend = f', improving vs recent avg ({trend_avg:+.3f}s)'
+                    else:
+                        trend = f', consistent with recent ({trend_avg:+.3f}s avg)'
+                    parts.append(f"{label}: {cur:+.3f}s vs best{trend}")
+                else:
+                    parts.append(f"{label}: {cur:+.3f}s vs best")
             if parts:
                 sector_str = f" Sector deltas — {', '.join(parts)}."
+
+        # Consistency score across last 5 laps (std dev)
+        consistency_str = ''
+        if len(recent) >= 3:
+            mean_t  = sum(recent) / len(recent)
+            std_dev = (sum((t - mean_t) ** 2 for t in recent) / len(recent)) ** 0.5
+            if std_dev > 1.5:
+                consistency_str = (
+                    f" Lap-to-lap consistency is poor (±{std_dev:.2f}s std dev over last "
+                    f"{len(recent)} laps) — flag this to the driver."
+                )
+            elif std_dev < 0.4 and len(recent) >= 4:
+                consistency_str = f" Driver is very consistent (±{std_dev:.2f}s std dev)."
+
+        # Tire degradation: 4+ consecutive laps each slower than the previous
+        deg_str = ''
+        if len(self._lap_times_this_session) >= 4:
+            tail = self._lap_times_this_session[-4:]
+            if all(tail[i] < tail[i + 1] for i in range(len(tail) - 1)):
+                deg_str = (
+                    f" Pace has been declining for {len(tail)} consecutive laps "
+                    f"(+{tail[-1] - tail[0]:.2f}s over that window) — likely tire degradation, "
+                    f"not driver error."
+                )
 
         # Handling tendencies string — suppress brake bias recs for 8 laps after one is given
         HANDLING_COOLDOWN = 8
@@ -3776,19 +4165,28 @@ class App(tk.Tk):
                 )
                 self._last_handling_coached_lap = lap_num
 
+        # Track name — used to prompt track-specific corner advice when sector data is present
+        with self._ctx_lock:
+            _ctx_snap = self._ctx
+        track_name = (_ctx_snap or {}).get('plan', {}).get('track', '') if _ctx_snap else ''
+        track_hint = (
+            f" Sectors are approximate thirds of the lap at {track_name} — "
+            f"when coaching sector-specific issues, name the relevant corners."
+        ) if (track_name and sector_deltas) else ''
+
         is_quali = session_type in self._QUALI_SESSION_TYPES
         if is_quali:
             question = (
                 f"Qualifying lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
                 f"{reason}. Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
-                f"Avg last 5: {self._fmt_lap_spoken(avg)}.{sector_str} "
+                f"Avg last 5: {self._fmt_lap_spoken(avg)}.{sector_str}{consistency_str}{track_hint} "
                 f"This is a qualifying session — focus only on lap time and driving technique, "
                 f"no race strategy or fuel. The lap time was already read out — do not repeat it."
             )
         else:
             question = (
                 f"Lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
-                f"{fpl_str}{reason}.{sector_str}{handling_str} "
+                f"{fpl_str}{reason}.{sector_str}{consistency_str}{deg_str}{handling_str}{track_hint} "
                 f"Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
                 f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
                 f"The lap time was already announced to the driver — give brief coaching only, "
@@ -3817,6 +4215,7 @@ class App(tk.Tk):
                         self.log(f'[COACHING] {answer}')
                         self.after(0, lambda: self._append_qa(f'[Auto] {question}', answer))
                         self.speak(answer)
+                        self._push_qa_to_pitwall(question, answer)
             except Exception as e:
                 self.log(f'Coaching error: {e}')
             finally:
