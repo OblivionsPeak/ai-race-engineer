@@ -27,14 +27,13 @@ except ImportError:
 POLL_INTERVAL = 0.25  # seconds
 
 CAR_LEFT_RIGHT = {
-    0: 'off',
-    1: 'off',
-    2: 'clear',
-    3: 'left',
-    4: 'right',
-    5: 'both',
-    6: 'left2',
-    7: 'right2',
+    0: 'off',     # irsdk_LROff
+    1: 'clear',   # irsdk_LRClear
+    2: 'left',    # irsdk_LRCarLeft
+    3: 'right',   # irsdk_LRCarRight
+    4: 'both',    # irsdk_LRCarLeftRight
+    5: 'left2',   # irsdk_LR2CarsLeft
+    6: 'right2',  # irsdk_LR2CarsRight
 }
 
 irsdk_checkered     = 0x0001
