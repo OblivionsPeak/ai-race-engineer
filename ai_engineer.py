@@ -4265,6 +4265,18 @@ class App(tk.Tk):
         self.speak(msg)
         return True
 
+    @staticmethod
+    def _clean_for_tts(text: str) -> str:
+        """Strip markdown symbols that TTS engines read aloud as punctuation names."""
+        import re
+        text = re.sub(r'\*+', '', text)       # *, **
+        text = re.sub(r'_+', '', text)        # _, __
+        text = re.sub(r'`+', '', text)        # `, ```
+        text = re.sub(r'#+\s*', '', text)     # #, ##, ### headings
+        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)  # [link text](url) → link text
+        text = re.sub(r'\s{2,}', ' ', text)   # collapse extra whitespace left behind
+        return text.strip()
+
     def _tts_worker(self):
         """Single persistent TTS thread — processes one utterance at a time."""
         sapi5_engine = None
@@ -4272,6 +4284,7 @@ class App(tk.Tk):
             text = self._tts_queue.get()
             if text is None:
                 break
+            text = self._clean_for_tts(text)
             voice_id = self._cfg.get('tts_voice', DEFAULT_VOICE)
             volume   = max(0.0, min(1.0, self._cfg.get('tts_volume', 1.0)))
             rate     = max(0.5, min(2.0, self._cfg.get('tts_rate', 1.0)))
