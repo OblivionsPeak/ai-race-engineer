@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.24"
+VERSION     = "1.1.25"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -403,10 +403,11 @@ class TelemetryThread(threading.Thread):
 
         ir                 = irsdk.IRSDK()
         ir.startup()
-        last_fpl_lap       = 0
-        fuel_at_lap_end    = None   # fuel level captured at each lap boundary (not every tick)
-        fuel_history       = []
-        auto_plan_detected = False
+        last_fpl_lap            = 0
+        fuel_at_lap_end         = None   # fuel level captured at each lap boundary (not every tick)
+        fuel_history            = []
+        auto_plan_detected      = False
+        last_pit_repair_left    = 0.0    # track changes to fire proactive damage alerts
 
         # Per-connection mutable state (reset implicitly on reconnect)
         sector_s1_delta: float | None = None  # delta vs session best at ~33% of lap
@@ -504,6 +505,41 @@ class TelemetryThread(threading.Thread):
                 gear_in        = int(ir['Gear']                            or 0)
                 rpm_in         = float(ir['RPM']                           or 0.0)
                 steer_max      = float(ir['SteeringWheelAngleMax']         or 3.14)
+
+                # Damage / engine vitals
+                pit_repair_left     = float(ir['PitRepairLeft']     or 0.0)
+                pit_opt_repair_left = float(ir['PitOptRepairLeft']   or 0.0)
+                fast_repair_avail   = ir['FastRepairAvailable']
+                fast_repair_used    = ir['FastRepairUsed']           or 0
+                engine_warnings_raw = int(ir['EngineWarnings']       or 0)
+                water_temp_c        = ir['WaterTemp']
+                oil_temp_c          = ir['OilTemp']
+                oil_press_kpa       = ir['OilPress']
+                oil_level_l         = ir['OilLevel']
+
+                def _tire_wear(corner):
+                    try:
+                        l = ir[f'{corner}wearL']
+                        m = ir[f'{corner}wearM']
+                        r = ir[f'{corner}wearR']
+                        vals = [x for x in (l, m, r) if x is not None]
+                        return round(sum(vals) / len(vals), 3) if vals else None
+                    except Exception:
+                        return None
+
+                tire_wear = {
+                    'LF': _tire_wear('LF'),
+                    'RF': _tire_wear('RF'),
+                    'LR': _tire_wear('LR'),
+                    'RR': _tire_wear('RR'),
+                }
+
+                engine_warnings = {
+                    'water_temp':    bool(engine_warnings_raw & 0x01),
+                    'fuel_pressure': bool(engine_warnings_raw & 0x02),
+                    'oil_pressure':  bool(engine_warnings_raw & 0x04),
+                    'stalled':       bool(engine_warnings_raw & 0x08),
+                }
 
                 # Build and queue a pit-wall telemetry frame (20 fps throttle handled in broadcast thread)
                 self._app._tele_frame = {
@@ -687,6 +723,18 @@ class TelemetryThread(threading.Thread):
                         'is_on_track':        is_on_track,
                         'stale':              False,
                     },
+                    'damage': {
+                        'pit_repair_s':     round(pit_repair_left, 1),
+                        'pit_opt_repair_s': round(pit_opt_repair_left, 1),
+                        'fast_repair_avail': int(fast_repair_avail) if fast_repair_avail is not None else None,
+                        'fast_repair_used':  fast_repair_used,
+                        'engine_warnings':  engine_warnings,
+                        'water_temp_c':     round(water_temp_c, 1) if water_temp_c is not None else None,
+                        'oil_temp_c':       round(oil_temp_c, 1) if oil_temp_c is not None else None,
+                        'oil_press_kpa':    round(oil_press_kpa, 1) if oil_press_kpa is not None else None,
+                        'oil_level_l':      round(oil_level_l, 2) if oil_level_l is not None else None,
+                        'tire_wear':        tire_wear,
+                    },
                     'session': {
                         'type':             session_type,
                         'time_remaining_s': _safe(time_remain_s),
@@ -705,6 +753,13 @@ class TelemetryThread(threading.Thread):
                         'black':   bool(session_flags & 0x10000),
                     },
                 }
+
+                # Proactive damage alert — fire when mandatory repair time increases
+                if pit_repair_left > last_pit_repair_left + 1.0 and is_on_track:
+                    self._app.after(0, lambda r=pit_repair_left, o=pit_opt_repair_left,
+                                    fr=fast_repair_avail:
+                        self._app._on_damage_detected(r, o, fr))
+                last_pit_repair_left = pit_repair_left
 
                 with self._app._ctx_lock:
                     self._app._ctx = ctx
@@ -2734,6 +2789,57 @@ class App(tk.Tk):
         self.speak(msg)
         self.log(f'[PIT] {msg}')
 
+    def _on_damage_detected(self, repair_s: float, opt_repair_s: float, fast_repair_avail):
+        """Called on main thread when PitRepairLeft increases — new damage taken."""
+        if not self._running:
+            return
+        fr_str = ''
+        if fast_repair_avail is not None:
+            avail = int(fast_repair_avail)
+            if avail < 255:  # 255 = unlimited in iRacing
+                fr_str = f' Fast repairs available: {avail}.'
+        opt_str = f' Optional repair: {opt_repair_s:.0f}s.' if opt_repair_s > 0 else ''
+        msg = (f"Damage alert: {repair_s:.0f}s mandatory repair time.{opt_str}{fr_str} "
+               f"Consider if pitting now or waiting to bundle with your planned stop.")
+        self.speak(msg)
+        self.log(f'[DAMAGE] {msg}')
+        threading.Thread(target=self._ask_damage_report, daemon=True).start()
+
+    def _ask_damage_report(self):
+        """Ask the AI for a damage assessment immediately after damage is detected."""
+        try:
+            with self._ctx_lock:
+                ctx = self._ctx
+            if not ctx:
+                return
+            token = self._cfg.get('token', '')
+            if not token:
+                return
+            system_prompt = self._build_system_prompt(ctx)
+            dmg = ctx.get('damage', {})
+            repair_s = dmg.get('pit_repair_s', 0)
+            opt_s    = dmg.get('pit_opt_repair_s', 0)
+            question = (
+                f"I just took damage. iRacing is showing {repair_s:.0f}s mandatory repair "
+                f"and {opt_s:.0f}s optional repair. "
+                f"Assess the damage situation and advise: should I pit immediately for repairs, "
+                f"wait to bundle with my planned pit stop, or use a fast repair? "
+                f"Consider current race position, fuel, and how much time the repairs would cost."
+            )
+            r = requests.post(
+                f'{BACKEND_URL}/engineer/coaching',
+                json={'token': token, 'system_prompt': system_prompt, 'question': question},
+                timeout=15,
+            )
+            if r.ok:
+                answer = r.json().get('answer', '')
+                if answer:
+                    self.speak(answer)
+                    self.log(f'[DAMAGE AI] {answer}')
+                    self._push_qa_to_pitwall(question, answer)
+        except Exception as e:
+            self.log(f'[DAMAGE] AI report failed: {e}')
+
     def _load_history_from_server(self):
         """Fetch session history from backend; fall back to local JSON on failure."""
         token = self._cfg.get('token', '')
@@ -3890,6 +3996,46 @@ class App(tk.Tk):
                 f"IMPORTANT: tell the driver you are still learning their fuel burn rate and "
                 f"cannot give confident fuel strategy yet. Do not invent or guess laps-remaining."
             )
+
+        # Damage report
+        dmg = ctx.get('damage', {})
+        repair_s     = dmg.get('pit_repair_s', 0)
+        opt_repair_s = dmg.get('pit_opt_repair_s', 0)
+        fr_avail     = dmg.get('fast_repair_avail')
+        fr_used      = dmg.get('fast_repair_used', 0)
+        eng_warn     = dmg.get('engine_warnings', {})
+        water_c      = dmg.get('water_temp_c')
+        oil_c        = dmg.get('oil_temp_c')
+        oil_kpa      = dmg.get('oil_press_kpa')
+        tire_wear    = dmg.get('tire_wear', {})
+
+        if repair_s > 0 or opt_repair_s > 0:
+            fr_str = ''
+            if fr_avail is not None and int(fr_avail) < 255:
+                fr_str = f' | Fast repairs: {fr_avail} available, {fr_used} used'
+            lines.append(
+                f"DAMAGE: {repair_s:.0f}s mandatory repair + {opt_repair_s:.0f}s optional{fr_str}"
+            )
+        else:
+            lines.append("DAMAGE: none (PitRepairLeft = 0)")
+
+        active_warnings = [k for k, v in eng_warn.items() if v]
+        if active_warnings:
+            lines.append(f"ENGINE WARNINGS: {', '.join(active_warnings).upper()}")
+        if water_c is not None or oil_c is not None:
+            vitals = []
+            if water_c is not None: vitals.append(f"Water {fmt_temp(water_c)}")
+            if oil_c is not None:   vitals.append(f"Oil {fmt_temp(oil_c)}")
+            if oil_kpa is not None: vitals.append(f"Oil press {oil_kpa:.0f}kPa")
+            lines.append(f"ENGINE VITALS: {' | '.join(vitals)}")
+
+        worn = {c: w for c, w in tire_wear.items() if w is not None and w < 0.5}
+        if worn:
+            wear_str = '  '.join(f"{c}:{w*100:.0f}%" for c, w in worn.items())
+            lines.append(f"TYRE WEAR (below 50%): {wear_str}")
+        elif any(w is not None for w in tire_wear.values()):
+            wear_str = '  '.join(f"{c}:{w*100:.0f}%" for c, w in tire_wear.items() if w is not None)
+            lines.append(f"TYRE WEAR: {wear_str}")
 
         # Incidents
         incidents = tele.get('incidents', 0)
