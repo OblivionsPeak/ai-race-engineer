@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.23"
+VERSION     = "1.1.24"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -3828,6 +3828,19 @@ class App(tk.Tk):
         else:
             _fuel_line = f"FUEL: {fuel_disp} remaining | laps remaining: unknown (fuel burn not yet measured)"
 
+        # Compute sensor-based last-safe pit lap when measured fuel data is available.
+        # This overrides the plan-based estimate so the AI doesn't recommend a planned
+        # pit lap that's beyond the actual fuel range.
+        current_lap_num = tele.get('current_lap') or 0
+        if sensor_laps is not None and isinstance(current_lap_num, (int, float)):
+            sensor_last_safe = int(current_lap_num) + max(int(math.floor(sensor_laps)) - 1, 0)
+            planned_last = live.get('pit_window_last')
+            last_safe_display = str(sensor_last_safe)
+            if isinstance(planned_last, (int, float)) and sensor_last_safe < int(planned_last):
+                last_safe_display += f" (SENSOR — plan said {int(planned_last)}, DO NOT use plan value)"
+        else:
+            last_safe_display = str(live.get('pit_window_last', '?'))
+
         if live.get('status') == 'finished':
             lines += [
                 f"RACE: {plan.get('name', 'Unknown')} | Duration: {race_hrs_fmt}",
@@ -3840,7 +3853,7 @@ class App(tk.Tk):
                 f"| STINT: {cs.get('stint_num', '?')} of {plan.get('total_stints', '?')}",
                 _fuel_line,
                 f"PIT WINDOW: lap {live.get('pit_window_optimal', '?')} "
-                f"(last safe: {live.get('pit_window_last', '?')}) | "
+                f"(last safe: {last_safe_display}) | "
                 f"{live.get('laps_until_pit', '?')} laps away | "
                 f"Status: {str(live.get('pit_window_status', '?')).upper()}",
                 f"PIT LOSS: {plan.get('pit_loss_s', 35)}s (configured — verify for this track/car)",
