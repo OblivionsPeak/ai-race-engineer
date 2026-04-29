@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.26"
+VERSION     = "1.1.27"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -408,6 +408,9 @@ class TelemetryThread(threading.Thread):
         fuel_history            = []
         auto_plan_detected      = False
         last_pit_repair_left    = 0.0    # track changes to fire proactive damage alerts
+        last_engine_warnings    = 0      # track new engine warning bits
+        last_meatball           = False  # track meatball (serviceable) flag transitions
+        fast_tick               = 0      # counts fast-path iterations to gate slow path
 
         # Per-connection mutable state (reset implicitly on reconnect)
         sector_s1_delta: float | None = None  # delta vs session best at ~33% of lap
@@ -454,98 +457,34 @@ class TelemetryThread(threading.Thread):
 
                 ir.freeze_var_buffer_latest()
 
-                # Auto-detect race plan once per connection if no manual plan exists
-                if not auto_plan_detected:
-                    auto_plan = _build_auto_plan_from_ir(ir)
-                    if auto_plan:
-                        auto_plan_detected = True
-                        self._app.after(0, lambda p=auto_plan: self._app._apply_auto_plan(p))
+                # ── FAST PATH — runs every tick at ~60 Hz ─────────────────────────
+                # Read only the variables needed for real-time telemetry, flags, and
+                # sector/dynamics capture. Everything else waits for the slow path.
 
-                with self._app._ctx_lock:
-                    plan      = self._app._plan
-                    stints    = self._app._stints
-                fuel_unit = self._app._cfg.get('fuel_unit', 'gal')
+                lap_dist_pct    = float(ir['LapDistPct']                 or 0.0)
+                throttle_in     = float(ir['Throttle']                   or 0.0)
+                brake_in        = float(ir['Brake']                      or 0.0)
+                lat_accel_in    = float(ir['LatAccel']                   or 0.0)
+                yaw_rate_in     = float(ir['YawRate']                    or 0.0)
+                speed_ms_in     = float(ir['Speed']                      or 0.0)
+                steering_in     = float(ir['SteeringWheelAngle']         or 0.0)
+                steer_max       = float(ir['SteeringWheelAngleMax']      or 3.14)
+                gear_in         = int(ir['Gear']                         or 0)
+                rpm_in          = float(ir['RPM']                        or 0.0)
+                current_lap     = ir['Lap']                              or 0
+                session_time    = ir['SessionTime']                      or 0.0
+                lap_delta_best  = ir['LapDeltaToSessionBestLap']
+                lap_delta_ok    = bool(ir['LapDeltaToSessionBestLap_OK'] or False)
+                session_flags   = int(ir['SessionFlags']                 or 0)
+                is_on_track     = bool(ir['IsOnTrack']                   or False)
+                pit_repair_left = float(ir['PitRepairLeft']              or 0.0)
+                engine_warnings_raw = int(ir['EngineWarnings']           or 0)
 
-                current_lap    = ir['Lap']                       or 0
-                fuel_raw       = ir['FuelLevel']                 # None if iRacing not providing it
-                session_time   = ir['SessionTime']               or 0.0
-                lap_last       = ir['LapLastLapTime']            or 0.0
-                lap_completed  = ir['LapCompleted']              or 0
-                session_type   = ir['SessionType']               or ''
-                time_remain_s  = ir['SessionTimeRemain']
-                laps_remain    = ir['SessionLapsRemainEx']
-                incidents      = ir['PlayerCarTeamIncidentCount'] or 0
-                air_temp_c     = ir['AirTemp']
-                track_temp_c   = ir['TrackTempCrew']
-                weather_wet    = bool(ir['WeatherDeclaredWet'] or False)
-
-                # Opponent data
-                car_idx_positions = ir['CarIdxPosition']   or []
-                car_idx_f2time    = ir['CarIdxF2Time']      or []
-                car_idx_on_pit    = ir['CarIdxOnPitRoad']   or []
-                car_idx_on_track  = ir['CarIdxOnTrack']     or []
-                my_car_idx        = ir['PlayerCarIdx']       or 0
-                driver_info       = ir['DriverInfo']         or {}
-
-                # Sector / dynamics telemetry
-                lap_dist_pct   = float(ir['LapDistPct']                    or 0.0)
-                lap_delta_best = ir['LapDeltaToSessionBestLap']
-                lap_delta_ok   = bool(ir['LapDeltaToSessionBestLap_OK']    or False)
-                track_wetness  = int(ir['TrackWetness']                    or 0)
-                session_flags  = int(ir['SessionFlags']                    or 0)
-                player_on_pit  = bool(ir['OnPitRoad']                      or False)
-                is_on_track    = bool(ir['IsOnTrack']                      or False)
-                pit_sv_flags   = int(ir['PitSvFlags']                      or 0)
-                throttle_in    = float(ir['Throttle']                      or 0.0)
-                brake_in       = float(ir['Brake']                         or 0.0)
-                lat_accel_in   = float(ir['LatAccel']                      or 0.0)
-                yaw_rate_in    = float(ir['YawRate']                       or 0.0)
-                speed_ms_in    = float(ir['Speed']                         or 0.0)
-                steering_in    = float(ir['SteeringWheelAngle']            or 0.0)
-                gear_in        = int(ir['Gear']                            or 0)
-                rpm_in         = float(ir['RPM']                           or 0.0)
-                steer_max      = float(ir['SteeringWheelAngleMax']         or 3.14)
-
-                # Damage / engine vitals
-                pit_repair_left     = float(ir['PitRepairLeft']     or 0.0)
-                pit_opt_repair_left = float(ir['PitOptRepairLeft']   or 0.0)
-                fast_repair_avail   = ir['FastRepairAvailable']
-                fast_repair_used    = ir['FastRepairUsed']           or 0
-                engine_warnings_raw = int(ir['EngineWarnings']       or 0)
-                water_temp_c        = ir['WaterTemp']
-                oil_temp_c          = ir['OilTemp']
-                oil_press_kpa       = ir['OilPress']
-                oil_level_l         = ir['OilLevel']
-
-                def _tire_wear(corner):
-                    try:
-                        l = ir[f'{corner}wearL']
-                        m = ir[f'{corner}wearM']
-                        r = ir[f'{corner}wearR']
-                        vals = [x for x in (l, m, r) if x is not None]
-                        return round(sum(vals) / len(vals), 3) if vals else None
-                    except Exception:
-                        return None
-
-                tire_wear = {
-                    'LF': _tire_wear('LF'),
-                    'RF': _tire_wear('RF'),
-                    'LR': _tire_wear('LR'),
-                    'RR': _tire_wear('RR'),
-                }
-
-                engine_warnings = {
-                    'water_temp':    bool(engine_warnings_raw & 0x01),
-                    'fuel_pressure': bool(engine_warnings_raw & 0x02),
-                    'oil_pressure':  bool(engine_warnings_raw & 0x04),
-                    'stalled':       bool(engine_warnings_raw & 0x08),
-                }
-
-                # Build and queue a pit-wall telemetry frame (20 fps throttle handled in broadcast thread)
+                # Update pit-wall broadcast frame (broadcast thread throttles to 20 fps)
                 self._app._tele_frame = {
                     't': round(throttle_in, 3),
                     'b': round(brake_in, 3),
-                    's': round(steering_in / max(steer_max, 0.01), 3),  # normalise to -1..1
+                    's': round(steering_in / max(steer_max, 0.01), 3),
                     'v': round(speed_ms_in, 1),
                     'g': gear_in,
                     'r': int(rpm_in),
@@ -554,26 +493,11 @@ class TelemetryThread(threading.Thread):
                     'ts': round(session_time, 2),
                 }
 
-                # Fire deferred lap-complete — wait 2 ticks so LapLastLapTime has time to update
-                if pending_lap_complete is not None:
-                    *_data, _ticks = pending_lap_complete
-                    if _ticks > 1:
-                        pending_lap_complete = (*_data, _ticks - 1)
-                    else:
-                        _plc, _pfpl, _psd, _pdy, _pst = _data
-                        pending_lap_complete = None
-                        if lap_last > 0:
-                            self._app.after(0, lambda lt=lap_last, lc=_plc, fp=_pfpl, st=_pst,
-                                            sd=dict(_psd), dy=dict(_pdy):
-                                self._app._on_lap_complete(lc, lt, fp, st, sd, dy))
-
-                # Reset sector snapshots at the start of each new lap
+                # Sector delta capture — needs high resolution to hit the windows reliably
                 if lap_dist_pct < 0.05:
                     sector_s1_delta = None
                     sector_s2_delta = None
                     sector_s3_delta = None
-
-                # Capture sector deltas at ~33% and ~67% of lap distance
                 if (0.31 < lap_dist_pct < 0.37 and sector_s1_delta is None
                         and lap_delta_ok and lap_delta_best is not None):
                     sector_s1_delta = round(float(lap_delta_best), 3)
@@ -584,17 +508,102 @@ class TelemetryThread(threading.Thread):
                         and lap_delta_ok and lap_delta_best is not None):
                     sector_s3_delta = round(float(lap_delta_best), 3)
 
-                # Accumulate per-tick dynamics for end-of-lap analysis
+                # Dynamics accumulation for end-of-lap handling analysis
                 dynamics_buffer.append(
                     (throttle_in, brake_in, lat_accel_in, yaw_rate_in, speed_ms_in))
 
-                # iRacing FuelLevel is always in litres; plan values are also in litres.
-                # fuel_unit is display-only — no conversion needed here.
+                # Proactive damage alert — fires immediately when PitRepairLeft increases
+                if pit_repair_left > last_pit_repair_left + 1.0 and is_on_track:
+                    _opt = float(ir['PitOptRepairLeft'] or 0.0)
+                    _fra = ir['FastRepairAvailable']
+                    self._app.after(0, lambda r=pit_repair_left, o=_opt, fr=_fra:
+                        self._app._on_damage_detected(r, o, fr))
+                last_pit_repair_left = pit_repair_left
+
+                # Meatball flag (irsdk_serviceable = 0x40000) — mechanical issue
+                meatball_now = bool(session_flags & 0x40000)
+                if meatball_now and not last_meatball:
+                    self._app.after(0, self._app._on_meatball_flag)
+                last_meatball = meatball_now
+
+                # Engine warning alerts — fire on new bits, not every tick
+                new_warn_bits = engine_warnings_raw & ~last_engine_warnings
+                if new_warn_bits and is_on_track:
+                    self._app.after(0, lambda b=new_warn_bits:
+                        self._app._on_engine_warning(b))
+                last_engine_warnings = engine_warnings_raw
+
+                # ── SLOW PATH — every 30 fast ticks (~2 Hz at 60 Hz poll) ──────────
+                # Fuel calcs, opponent parsing, ctx build — don't need every frame.
+                fast_tick += 1
+                if fast_tick % 30 != 0:
+                    self._stop.wait(0.016)
+                    continue
+
+                # Auto-detect race plan once per connection if no manual plan exists
+                if not auto_plan_detected:
+                    auto_plan = _build_auto_plan_from_ir(ir)
+                    if auto_plan:
+                        auto_plan_detected = True
+                        self._app.after(0, lambda p=auto_plan: self._app._apply_auto_plan(p))
+
+                with self._app._ctx_lock:
+                    plan   = self._app._plan
+                    stints = self._app._stints
+                fuel_unit = self._app._cfg.get('fuel_unit', 'gal')
+
+                fuel_raw       = ir['FuelLevel']
+                lap_last       = ir['LapLastLapTime']            or 0.0
+                lap_completed  = ir['LapCompleted']              or 0
+                session_type   = ir['SessionType']               or ''
+                time_remain_s  = ir['SessionTimeRemain']
+                laps_remain    = ir['SessionLapsRemainEx']
+                incidents      = ir['PlayerCarTeamIncidentCount'] or 0
+                air_temp_c     = ir['AirTemp']
+                track_temp_c   = ir['TrackTempCrew']
+                weather_wet    = bool(ir['WeatherDeclaredWet'] or False)
+                track_wetness  = int(ir['TrackWetness']          or 0)
+                player_on_pit  = bool(ir['OnPitRoad']            or False)
+                pit_sv_flags   = int(ir['PitSvFlags']            or 0)
+
+                # Damage / engine vitals (full reads on slow path for ctx)
+                pit_opt_repair_left = float(ir['PitOptRepairLeft']  or 0.0)
+                fast_repair_avail   = ir['FastRepairAvailable']
+                fast_repair_used    = ir['FastRepairUsed']           or 0
+                water_temp_c        = ir['WaterTemp']
+                oil_temp_c          = ir['OilTemp']
+                oil_press_kpa       = ir['OilPress']
+                oil_level_l         = ir['OilLevel']
+
+                def _tire_wear(corner):
+                    try:
+                        vals = [x for x in (ir[f'{corner}wearL'], ir[f'{corner}wearM'],
+                                             ir[f'{corner}wearR']) if x is not None]
+                        return round(sum(vals) / len(vals), 3) if vals else None
+                    except Exception:
+                        return None
+
+                tire_wear = {'LF': _tire_wear('LF'), 'RF': _tire_wear('RF'),
+                             'LR': _tire_wear('LR'), 'RR': _tire_wear('RR')}
+
+                engine_warnings = {
+                    'water_temp':    bool(engine_warnings_raw & 0x01),
+                    'fuel_pressure': bool(engine_warnings_raw & 0x02),
+                    'oil_pressure':  bool(engine_warnings_raw & 0x04),
+                    'stalled':       bool(engine_warnings_raw & 0x08),
+                }
+
+                # Opponent data
+                car_idx_positions = ir['CarIdxPosition']   or []
+                car_idx_f2time    = ir['CarIdxF2Time']      or []
+                car_idx_on_pit    = ir['CarIdxOnPitRoad']   or []
+                car_idx_on_track  = ir['CarIdxOnTrack']     or []
+                my_car_idx        = ir['PlayerCarIdx']       or 0
+                driver_info       = ir['DriverInfo']         or {}
+
                 fuel = fuel_raw
 
-                # Rolling fuel-per-lap delta.
-                # fuel_at_lap_end is captured ONLY at lap boundaries so the delta
-                # spans a full lap, not just one polling tick.
+                # Rolling fuel-per-lap delta (lap-boundary triggered)
                 fuel_delta = {}
                 if lap_completed > last_fpl_lap:
                     if fuel_at_lap_end is not None and fuel is not None:
@@ -608,12 +617,10 @@ class TelemetryThread(threading.Thread):
                                 'last_actual_fpl': actual_fpl,
                                 'history':         list(fuel_history),
                             }
-                            # Update auto-detected plan's FPL once we have 3+ laps of data
                             if len(fuel_history) >= 3 and self._app._plan.get('auto_detected'):
                                 self._app.after(0, lambda f=avg_fpl: self._app._update_auto_fpl(f))
                     else:
-                        actual_fpl = 0.0  # first lap boundary — no delta yet
-                    # Also fire lap coaching with sector deltas and dynamics summary
+                        actual_fpl = 0.0
                     if lap_last > 0:
                         _fpl_for_coach = actual_fpl if (0.05 < actual_fpl < 10.0) else None
                         _sd: dict = {}
@@ -632,14 +639,26 @@ class TelemetryThread(threading.Thread):
                                                     if d[0] > 0.7 and abs(d[2]) < 3.0 and d[4] > 20),
                             }
                         dynamics_buffer.clear()
+                        # 2 slow ticks (~1 s) lets LapLastLapTime settle before coaching fires
                         pending_lap_complete = (lap_completed, _fpl_for_coach,
                                                 dict(_sd), dict(_dyn), session_type, 2)
                     if fuel is not None:
-                        fuel_at_lap_end = fuel  # capture fuel at this lap boundary
-                    last_fpl_lap    = lap_completed
+                        fuel_at_lap_end = fuel
+                    last_fpl_lap = lap_completed
 
-                # Always expose running FPL average so the alert loop has sensor-based fuel data
-                # on every tick, not just the lap-completion tick where fuel_delta is populated.
+                # Fire deferred lap-complete after 2 slow-path ticks
+                if pending_lap_complete is not None:
+                    *_data, _ticks = pending_lap_complete
+                    if _ticks > 1:
+                        pending_lap_complete = (*_data, _ticks - 1)
+                    else:
+                        _plc, _pfpl, _psd, _pdy, _pst = _data
+                        pending_lap_complete = None
+                        if lap_last > 0:
+                            self._app.after(0, lambda lt=lap_last, lc=_plc, fp=_pfpl, st=_pst,
+                                            sd=dict(_psd), dy=dict(_pdy):
+                                self._app._on_lap_complete(lc, lt, fp, st, sd, dy))
+
                 if not fuel_delta and fuel_history:
                     _avg_fpl = round(sum(fuel_history) / len(fuel_history), 4)
                     fuel_delta = {
@@ -648,7 +667,7 @@ class TelemetryThread(threading.Thread):
                         'history':         list(fuel_history),
                     }
 
-                # Track player's own pit stops for service-time estimation
+                # Player pit stop tracking
                 if player_on_pit and not player_on_pit_prev:
                     player_pit_entry_time = session_time
                     player_pit_entry_fuel = fuel
@@ -663,7 +682,7 @@ class TelemetryThread(threading.Thread):
                     player_pit_entry_fuel = None
                 player_on_pit_prev = player_on_pit
 
-                # Build opponents dict
+                # Opponent parsing
                 opponents = {}
                 my_position = None
                 try:
@@ -671,17 +690,16 @@ class TelemetryThread(threading.Thread):
                     my_position = my_pos if my_pos > 0 else None
                     drivers     = driver_info.get('Drivers', []) or []
                     idx_map     = {d.get('CarIdx', -1): d.get('UserName', '?') for d in drivers}
-
                     if my_pos > 1:
-                        ahead = _find_car_at_pos(my_pos - 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map, car_idx_on_track)
+                        ahead = _find_car_at_pos(my_pos - 1, car_idx_positions, car_idx_f2time,
+                                                 my_car_idx, idx_map, car_idx_on_track)
                         if ahead:
                             opponents['ahead'] = ahead
-                    behind = _find_car_at_pos(my_pos + 1, car_idx_positions, car_idx_f2time, my_car_idx, idx_map, car_idx_on_track)
+                    behind = _find_car_at_pos(my_pos + 1, car_idx_positions, car_idx_f2time,
+                                              my_car_idx, idx_map, car_idx_on_track)
                     if behind:
                         opponents['behind'] = behind
                     opponents['my_position'] = my_position
-
-                    # Overcut/undercut: detect opponents entering/exiting pit road
                     for _ci, _on_pit in enumerate(car_idx_on_pit):
                         if _ci == my_car_idx:
                             continue
@@ -724,16 +742,16 @@ class TelemetryThread(threading.Thread):
                         'stale':              False,
                     },
                     'damage': {
-                        'pit_repair_s':     round(pit_repair_left, 1),
-                        'pit_opt_repair_s': round(pit_opt_repair_left, 1),
+                        'pit_repair_s':      round(pit_repair_left, 1),
+                        'pit_opt_repair_s':  round(pit_opt_repair_left, 1),
                         'fast_repair_avail': int(fast_repair_avail) if fast_repair_avail is not None else None,
                         'fast_repair_used':  fast_repair_used,
-                        'engine_warnings':  engine_warnings,
-                        'water_temp_c':     round(water_temp_c, 1) if water_temp_c is not None else None,
-                        'oil_temp_c':       round(oil_temp_c, 1) if oil_temp_c is not None else None,
-                        'oil_press_kpa':    round(oil_press_kpa, 1) if oil_press_kpa is not None else None,
-                        'oil_level_l':      round(oil_level_l, 2) if oil_level_l is not None else None,
-                        'tire_wear':        tire_wear,
+                        'engine_warnings':   engine_warnings,
+                        'water_temp_c':      round(water_temp_c, 1) if water_temp_c is not None else None,
+                        'oil_temp_c':        round(oil_temp_c, 1) if oil_temp_c is not None else None,
+                        'oil_press_kpa':     round(oil_press_kpa, 1) if oil_press_kpa is not None else None,
+                        'oil_level_l':       round(oil_level_l, 2) if oil_level_l is not None else None,
+                        'tire_wear':         tire_wear,
                     },
                     'session': {
                         'type':             session_type,
@@ -747,19 +765,13 @@ class TelemetryThread(threading.Thread):
                         'track_wetness': track_wetness,
                     },
                     'session_flags': {
-                        'blue':    bool(session_flags & 0x2000),
-                        'yellow':  bool(session_flags & 0x0010),
-                        'caution': bool(session_flags & 0x4000),
-                        'black':   bool(session_flags & 0x10000),
+                        'blue':       bool(session_flags & 0x0020),   # irsdk_blue
+                        'yellow':     bool(session_flags & 0x0008),   # irsdk_yellow
+                        'caution':    bool(session_flags & 0x4000),   # irsdk_caution
+                        'black':      bool(session_flags & 0x10000),  # irsdk_black (DQ)
+                        'meatball':   bool(session_flags & 0x40000),  # irsdk_serviceable
                     },
                 }
-
-                # Proactive damage alert — fire when mandatory repair time increases
-                if pit_repair_left > last_pit_repair_left + 1.0 and is_on_track:
-                    self._app.after(0, lambda r=pit_repair_left, o=pit_opt_repair_left,
-                                    fr=fast_repair_avail:
-                        self._app._on_damage_detected(r, o, fr))
-                last_pit_repair_left = pit_repair_left
 
                 with self._app._ctx_lock:
                     self._app._ctx = ctx
@@ -769,7 +781,7 @@ class TelemetryThread(threading.Thread):
             except Exception as e:
                 self._app.log(f'Telemetry error: {e}')
 
-            self._stop.wait(1.0)
+            self._stop.wait(0.016)
 
         self._app.log('Telemetry thread stopped.')
 
@@ -949,6 +961,7 @@ class App(tk.Tk):
         self._gap_history: dict = {'ahead': [], 'behind': []}
         self._last_blue_flag_alert: float = 0.0
         self._prev_blue_flag: bool = False
+        self._prev_meatball: bool = False
         self._pit_stop_log: list = []
         self._prev_position: int | None = None
         self._prev_incidents: int = 0
@@ -2792,6 +2805,34 @@ class App(tk.Tk):
         self.speak(msg)
         self.log(f'[PIT] {msg}')
 
+    def _on_meatball_flag(self):
+        """Fired when iRacing raises the meatball (serviceable/mechanical) flag."""
+        if not self._running:
+            return
+        msg = ("Meatball flag — mechanical issue flagged. Check your mirrors and pit as soon as "
+               "safely possible for inspection and repairs.")
+        self.speak(msg)
+        self.log(f'[FLAG] {msg}')
+        threading.Thread(target=self._ask_damage_report, daemon=True).start()
+
+    def _on_engine_warning(self, new_bits: int):
+        """Fired when a new EngineWarnings bit appears — alerts driver to specific issue."""
+        if not self._running:
+            return
+        labels = {
+            0x01: 'water temperature warning',
+            0x02: 'fuel pressure warning',
+            0x04: 'oil pressure warning',
+            0x08: 'engine stalled',
+        }
+        triggered = [labels[b] for b in (0x01, 0x02, 0x04, 0x08) if new_bits & b]
+        if not triggered:
+            return
+        issue = ' and '.join(triggered)
+        msg = f"Engine warning: {issue}. Monitor gauges and consider pitting."
+        if self._say(f'engine_warn_{new_bits}', msg, 30):
+            self.log(f'[ENGINE] {msg}')
+
     def _on_damage_detected(self, repair_s: float, opt_repair_s: float, fast_repair_avail):
         """Called on main thread when PitRepairLeft increases — new damage taken."""
         if not self._running:
@@ -2955,6 +2996,7 @@ class App(tk.Tk):
         self._gap_history                = {'ahead': [], 'behind': []}
         self._last_blue_flag_alert       = 0.0
         self._prev_blue_flag             = False
+        self._prev_meatball              = False
         self._pit_stop_log               = []
         self._prev_position          = None
         self._prev_incidents         = 0
