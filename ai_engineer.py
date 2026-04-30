@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.33"
+VERSION     = "1.1.34"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -45,6 +45,7 @@ _ensure('edge-tts', 'edge_tts')
 
 import asyncio
 import queue
+import re
 import requests
 import tempfile
 import threading
@@ -395,9 +396,18 @@ class TelemetryThread(threading.Thread):
         super().__init__(daemon=True)
         self._app  = app_ref
         self._stop = threading.Event()
+        self._ir   = None  # irsdk instance — set in run() for send_pit_command access
 
     def stop(self):
         self._stop.set()
+
+    def send_pit_command(self, cmd: int, value: int = 0):
+        """Send a pit box command via irsdk. cmd integers follow irsdk.PitCommandMode."""
+        try:
+            if self._ir and self._ir.is_initialized and self._ir.is_connected:
+                self._ir.pit_command(cmd, value)
+        except Exception:
+            pass
 
     def run(self):
         if not IRSDK_AVAILABLE:
@@ -407,6 +417,7 @@ class TelemetryThread(threading.Thread):
 
         ir                 = irsdk.IRSDK()
         ir.startup()
+        self._ir           = ir   # expose to send_pit_command()
         last_fpl_lap            = 0
         fuel_at_lap_end         = None   # fuel level captured at each lap boundary (not every tick)
         fuel_history            = []
@@ -479,12 +490,20 @@ class TelemetryThread(threading.Thread):
                 rpm_in          = float(ir['RPM']                        or 0.0)
                 current_lap     = ir['Lap']                              or 0
                 session_time    = ir['SessionTime']                      or 0.0
-                lap_delta_best  = ir['LapDeltaToSessionBestLap']
-                lap_delta_ok    = bool(ir['LapDeltaToSessionBestLap_OK'] or False)
+                lap_delta_best     = ir['LapDeltaToSessionBestLap']
+                lap_delta_ok       = bool(ir['LapDeltaToSessionBestLap_OK'] or False)
+                lap_delta_my_best  = ir['LapDeltaToMyBestLap']
+                lap_delta_my_best_ok = bool(ir['LapDeltaToMyBestLap_OK'] or False)
                 session_flags   = int(ir['SessionFlags']                 or 0)
                 is_on_track     = bool(ir['IsOnTrack']                   or False)
                 pit_repair_left = float(ir['PitRepairLeft']              or 0.0)
                 engine_warnings_raw = int(ir['EngineWarnings']           or 0)
+
+                # Feature 5: in practice use personal best delta, else session best delta
+                _is_practice = self._app._current_session_type.lower() in (
+                    'practice', 'open practice', 'lone practice')
+                _eff_delta    = lap_delta_my_best if _is_practice else lap_delta_best
+                _eff_delta_ok = lap_delta_my_best_ok if _is_practice else lap_delta_ok
 
                 # Update pit-wall broadcast frame (broadcast thread throttles to 20 fps)
                 self._app._tele_frame = {
@@ -505,18 +524,18 @@ class TelemetryThread(threading.Thread):
                     sector_s2_delta = None
                     sector_s3_delta = None
                 if (0.31 < lap_dist_pct < 0.37 and sector_s1_delta is None
-                        and lap_delta_ok and lap_delta_best is not None):
-                    sector_s1_delta = round(float(lap_delta_best), 3)
+                        and _eff_delta_ok and _eff_delta is not None):
+                    sector_s1_delta = round(float(_eff_delta), 3)
                     self._app.after(0, lambda d=sector_s1_delta:
                         self._app._on_sector_delta('S1', d))
                 if (0.63 < lap_dist_pct < 0.69 and sector_s2_delta is None
-                        and lap_delta_ok and lap_delta_best is not None):
-                    sector_s2_delta = round(float(lap_delta_best), 3)
+                        and _eff_delta_ok and _eff_delta is not None):
+                    sector_s2_delta = round(float(_eff_delta), 3)
                     self._app.after(0, lambda d=sector_s2_delta:
                         self._app._on_sector_delta('S2', d))
                 if (0.92 < lap_dist_pct < 0.98 and sector_s3_delta is None
-                        and lap_delta_ok and lap_delta_best is not None):
-                    sector_s3_delta = round(float(lap_delta_best), 3)
+                        and _eff_delta_ok and _eff_delta is not None):
+                    sector_s3_delta = round(float(_eff_delta), 3)
                     self._app.after(0, lambda d=sector_s3_delta:
                         self._app._on_sector_delta('S3', d))
 
@@ -568,6 +587,7 @@ class TelemetryThread(threading.Thread):
                 lap_last       = ir['LapLastLapTime']            or 0.0
                 lap_completed  = ir['LapCompleted']              or 0
                 session_type   = ir['SessionType']               or ''
+                self._app._current_session_type = session_type   # Feature 5: practice delta
                 time_remain_s  = ir['SessionTimeRemain']
                 laps_remain    = ir['SessionLapsRemainEx']
                 incidents      = ir['PlayerCarTeamIncidentCount'] or 0
@@ -1064,9 +1084,12 @@ class App(tk.Tk):
         self._prev_on_pit_road: bool = False       # Feature 1: gap on pit exit
         self._stint_lap: int = 0                   # Feature 4: stint lap counter
         self._did_pit_this_lap: bool = False       # Feature 4: pit detected this lap
+        self._is_out_lap_next: bool = False        # Feature 2: next lap is out-lap
         self._driving_mode: str = 'normal'         # Feature 5: push/conserve mode
         self._current_car_path: str = ''           # Feature 8: per-car config
         self._tyre_wear_by_lap: dict = {}          # Feature 6: per-lap tyre wear tracking
+        self._current_session_type: str = ''       # Feature 5: set by slow path for fast path use
+        self._personal_best_lap: float = 0.0      # Feature 5: personal best in practice
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -1544,6 +1567,11 @@ class App(tk.Tk):
             self._mode_label.config(text='', fg=BG, bg=BG)
         self.speak(msg)
         self.log(f'[MODE] Driving mode set to {mode}')
+
+    def _pit_command(self, cmd: int, value: int = 0):
+        """Send a pit box command to iRacing via the TelemetryThread."""
+        if self._telemetry_thread:
+            self._telemetry_thread.send_pit_command(cmd, value)
 
     def _update_pitwall_btn(self):
         if self._server_session_id:
@@ -3360,7 +3388,10 @@ class App(tk.Tk):
         self._prev_on_pit_road       = False
         self._stint_lap              = 0
         self._did_pit_this_lap       = False
+        self._is_out_lap_next        = False
         self._tyre_wear_by_lap       = {}
+        self._current_session_type   = ''
+        self._personal_best_lap      = 0.0
 
         self._stop_evt.clear()
         self._running = True
@@ -4315,6 +4346,15 @@ class App(tk.Tk):
             self.log(f'You: "{question}"')
             # Acknowledgment gate — driver said "copy", "roger", etc.
             _ql = question.lower().rstrip('. ')
+
+            # ── Feature 4: Voice help command ─────────────────────────────────
+            _HELP_PHRASES = ('what can you do', 'help', 'list commands', 'what commands',
+                             'what do you know', 'what can i say', 'voice commands')
+            if any(p in _ql for p in _HELP_PHRASES) and len(_ql) < 40:
+                self._speak_help()
+                self.after(0, self._reset_talk_label)
+                return
+
             _ACK_PHRASES = ('copy', 'roger', 'acknowledged', 'got it',
                             'affirmative', 'understood', 'noted', 'copy that')
             if any(_ql == p or _ql.startswith(p + ' ') or _ql.startswith(p + ',')
@@ -4331,6 +4371,56 @@ class App(tk.Tk):
             if any(k in _ql for k in ('normal mode', 'reset mode', 'back to normal')):
                 self.after(0, lambda: self._update_driving_mode('normal'))
                 return
+
+            # ── Feature 3: Pit box voice commands ────────────────────────────
+            if any(k in _ql for k in ('clear pit', 'cancel pit', 'no service', 'cancel service')):
+                self.after(0, lambda: self._pit_command(0))
+                self.speak("Pit services cleared")
+                self.after(0, self._reset_talk_label)
+                return
+
+            _fuel_match = re.search(r'add (\d+(?:\.\d+)?)\s*(?:litres?|liters?|l\b)', _ql)
+            if _fuel_match:
+                _litres = int(float(_fuel_match.group(1)))
+                self.after(0, lambda l=_litres: self._pit_command(2, l))
+                self.speak(f"Adding {_litres} litres of fuel")
+                self.after(0, self._reset_talk_label)
+                return
+
+            if any(k in _ql for k in ('change all tyres', 'change all tires', 'fresh tyres',
+                                       'fresh tires', 'four tyres', 'four tires')):
+                self.after(0, lambda: [self._pit_command(c) for c in (3, 4, 5, 6)])
+                self.speak("Changing all four tyres")
+                self.after(0, self._reset_talk_label)
+                return
+
+            if any(k in _ql for k in ('change front tyres', 'change front tires',
+                                       'front tyres only', 'fronts only')):
+                self.after(0, lambda: [self._pit_command(c) for c in (3, 4)])
+                self.speak("Changing front tyres")
+                self.after(0, self._reset_talk_label)
+                return
+
+            if any(k in _ql for k in ('change rear tyres', 'change rear tires',
+                                       'rear tyres only', 'rears only')):
+                self.after(0, lambda: [self._pit_command(c) for c in (5, 6)])
+                self.speak("Changing rear tyres")
+                self.after(0, self._reset_talk_label)
+                return
+
+            if any(k in _ql for k in ('no tyre change', 'no tire change', 'cancel tyres',
+                                       'cancel tires', 'no tyres', 'no tires')):
+                self.after(0, lambda: self._pit_command(7))
+                self.speak("Tyre changes cancelled")
+                self.after(0, self._reset_talk_label)
+                return
+
+            if any(k in _ql for k in ('fast repair', 'use fast repair')):
+                self.after(0, lambda: self._pit_command(8))
+                self.speak("Fast repair requested")
+                self.after(0, self._reset_talk_label)
+                return
+
             # Route pit-strategy and fuel-save questions to focused handlers
             _pit_keywords    = ('pit', 'box', 'stop', 'stay out', 'extend')
             _strategy_intent = ('should', 'when', 'now', 'this lap', 'strategy', 'call')
@@ -4368,6 +4458,17 @@ class App(tk.Tk):
                 os.remove(wav_path)
             except Exception:
                 pass
+
+    def _speak_help(self):
+        msg = (
+            "You can ask me anything about the race — pit strategy, fuel, gaps, tyre wear, "
+            "weather, or lap pace. Quick commands: say 'push mode' or 'conserve mode' to change driving intent, "
+            "'copy' to snooze coaching, 'add X litres' to set pit fuel, "
+            "'change all tyres' or 'no tyre change' to set tyre service, "
+            "'fast repair' to request a fast repair, and 'normal mode' to reset."
+        )
+        self.speak(msg)
+        self.log('[HELP] Voice command list spoken')
 
     # ── Text fallback ─────────────────────────────────────────────────────────
 
@@ -4731,6 +4832,8 @@ class App(tk.Tk):
     _RACE_SESSION_TYPES   = {'race'}
     _QUALI_SESSION_TYPES  = {'lone qualify', 'open qualify', 'qualify'}
 
+    _PRACTICE_SESSION_TYPES = {'practice', 'open practice', 'lone practice'}
+
     def _on_lap_complete(self, lap_num: int, lap_time: float, fpl, session_type: str = '',
                          sector_deltas: dict | None = None, lap_dynamics: dict | None = None):
         if lap_num <= self._last_coached_lap:
@@ -4741,13 +4844,28 @@ class App(tk.Tk):
         if not self._running:
             return
         st = session_type.lower() if session_type else ''
-        # Skip entirely for practice / open-practice / unknown session types
-        if st and st not in self._RACE_SESSION_TYPES and st not in self._QUALI_SESSION_TYPES:
+        is_practice = st in self._PRACTICE_SESSION_TYPES
+        # Skip entirely for unknown session types (not race, quali, or practice)
+        if st and st not in self._RACE_SESSION_TYPES and st not in self._QUALI_SESSION_TYPES \
+                and not is_practice:
             self._last_coached_lap = lap_num
             return
 
+        # ── Feature 2: In/out-lap suppression ────────────────────────────────
+        is_inlap  = self._did_pit_this_lap   # pit happened this lap → this is the in-lap
+        is_outlap = self._is_out_lap_next    # lap after a pit stop → this is the out-lap
+        if is_inlap:
+            self._is_out_lap_next = True
+        else:
+            self._is_out_lap_next = False
+
         if self._session_best_lap <= 0 or lap_time < self._session_best_lap:
             self._session_best_lap = lap_time
+
+        # Feature 5 — track personal best in practice
+        if is_practice:
+            if self._personal_best_lap <= 0 or lap_time < self._personal_best_lap:
+                self._personal_best_lap = lap_time
 
         self._total_laps_this_session += 1
         self._lap_times_this_session.append(lap_time)
@@ -4791,6 +4909,14 @@ class App(tk.Tk):
                 and _scl and self._stint_lap > 0 and self._stint_lap % _scl == 0):
             self._say(f'stint_lap_{self._stint_lap}',
                       f"Lap {self._stint_lap} of your stint.", 0)
+
+        # ── Feature 2: Skip coaching on in-laps and out-laps ─────────────────
+        if is_inlap:
+            self.log(f'[LAP] In-lap suppressed — no coaching (lap {lap_num})')
+            return
+        if is_outlap:
+            self.log(f'[LAP] Out-lap suppressed — no coaching (lap {lap_num})')
+            return
 
         # Feature 6 — Store tyre wear for this lap and calculate degradation
         _tw_snap = tele_snap.get('tire_wear', {})
@@ -4862,7 +4988,8 @@ class App(tk.Tk):
                   self._per_lap_dynamics.get(lap_num),
                   rival_p1_time,
                   self._driving_mode,
-                  dict(self._tyre_wear_by_lap)),
+                  dict(self._tyre_wear_by_lap),
+                  self._personal_best_lap),
             daemon=True,
         ).start()
 
@@ -4871,7 +4998,8 @@ class App(tk.Tk):
                           lap_dynamics: dict | None = None,
                           rival_p1_last_lap: float = 0.0,
                           driving_mode: str = 'normal',
-                          tyre_wear_by_lap: dict | None = None):
+                          tyre_wear_by_lap: dict | None = None,
+                          personal_best_lap: float = 0.0):
         recent   = self._lap_times_this_session[-5:]
         avg      = sum(recent) / len(recent) if recent else lap_time
         imperial = (self._cfg.get('units_system', 'metric') == 'imperial')
@@ -5026,7 +5154,8 @@ class App(tk.Tk):
         elif driving_mode == 'conserve':
             mode_str = ' (Conserve mode: prioritise fuel economy over lap time.)'
 
-        is_quali = session_type in self._QUALI_SESSION_TYPES
+        is_quali    = session_type in self._QUALI_SESSION_TYPES
+        is_practice = session_type in self._PRACTICE_SESSION_TYPES
         if is_quali:
             question = (
                 f"Qualifying lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
@@ -5035,6 +5164,19 @@ class App(tk.Tk):
                 f"{mode_str} "
                 f"This is a qualifying session — focus only on lap time and driving technique, "
                 f"no race strategy or fuel. The lap time was already read out — do not repeat it."
+            )
+        elif is_practice:
+            _pb_str = (f"Personal best: {self._fmt_lap_spoken(personal_best_lap)}. "
+                       if personal_best_lap > 0 else '')
+            question = (
+                f"Practice lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
+                f"{reason}. {_pb_str}"
+                f"Avg last 5: {self._fmt_lap_spoken(avg)}.{sector_str}{consistency_str}"
+                f"{deg_str}{handling_str}{track_hint}{mode_str} "
+                f"Practice session — give technique feedback focused on finding time. "
+                f"No race strategy or fuel advice. "
+                f"The lap time was already read out — do not repeat it. "
+                f"Always express times as minutes and seconds."
             )
         else:
             question = (
@@ -5109,7 +5251,6 @@ class App(tk.Tk):
     @staticmethod
     def _clean_for_tts(text: str) -> str:
         """Strip markdown symbols that TTS engines read aloud as punctuation names."""
-        import re
         text = re.sub(r'\*+', '', text)       # *, **
         text = re.sub(r'_+', '', text)        # _, __
         text = re.sub(r'`+', '', text)        # `, ```
