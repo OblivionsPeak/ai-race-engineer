@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.36"
+VERSION     = "1.1.37"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -177,6 +177,23 @@ DEFAULTS = {
     'pit_loss_s':        25,      # estimated pit lane time loss in seconds
     'auto_fuel':         True,    # automatically set fuel amount on pit entry
     'max_stint_mins':    0,       # max stint time in minutes (0 = disabled)
+    'fuel_safety_laps':  1.5,     # fractional-lap buffer added to minimum fuel load
+    'compound_life': {            # expected tyre life per compound category (laps)
+        'soft':   20,
+        'medium': 35,
+        'hard':   55,
+        'wet':    40,
+        'inter':  30,
+    },
+}
+
+# Mapping from iRacing compound name strings → generic category
+COMPOUND_CATEGORY = {
+    'soft':         'soft',   'ss': 'soft',   's': 'soft',
+    'medium':       'medium', 'mm': 'medium', 'm': 'medium',
+    'hard':         'hard',   'hh': 'hard',   'h': 'hard',
+    'wet':          'wet',    'ww': 'wet',    'w': 'wet',
+    'inter':        'inter',  'intermediate': 'inter',
 }
 
 def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
@@ -242,6 +259,17 @@ def save_config(cfg: dict):
 FUEL_MODES = {'normal': 1.0, 'push': 1.08, 'save': 0.92}
 
 
+def _optimise_fuel_load(stint_laps: int, fpl: float, capacity: float,
+                         safety_laps: float = 1.5) -> float:
+    """
+    Calculate minimum fuel to complete stint_laps plus a safety margin.
+    safety_laps: fractional laps of extra fuel as buffer (default 1.5).
+    Returns the fuel load rounded up to nearest 0.1L, capped at capacity.
+    """
+    minimum = fpl * (stint_laps + safety_laps)
+    return min(round(math.ceil(minimum * 10) / 10, 1), capacity)
+
+
 def _calculate_stints(plan: dict) -> list:
     race_s     = plan['race_duration_hrs'] * 3600
     lap_s      = plan['lap_time_s']
@@ -255,6 +283,7 @@ def _calculate_stints(plan: dict) -> list:
     fatigue_laps   = int(math.floor(max_hrs * 3600 / lap_s)) if lap_s > 0 else 999
     laps_per_stint = max(min(laps_per_tank, fatigue_laps), 1)
 
+    safety_laps = plan.get('fuel_safety_laps', DEFAULTS['fuel_safety_laps'])
     stints, current_lap, stint_num, driver_idx, elapsed_s = [], 1, 1, 0, 0.0
     n = max(len(drivers), 1)
 
@@ -272,7 +301,7 @@ def _calculate_stints(plan: dict) -> list:
             'start_lap':     current_lap,
             'end_lap':       end_lap,
             'pit_lap':       end_lap if not is_last else None,
-            'fuel_load':     min(round(stint_laps * fpl + fpl, 2), capacity),
+            'fuel_load':     _optimise_fuel_load(stint_laps, fpl, capacity, safety_laps),
             'laps_in_stint': stint_laps,
             'is_last':       is_last,
         })
@@ -287,7 +316,8 @@ def _calculate_stints(plan: dict) -> list:
 # ---------------------------------------------------------------------------
 # Live status calculation
 # ---------------------------------------------------------------------------
-def _calc_live_status(current_lap: int, stints: list, plan: dict) -> dict:
+def _calc_live_status(current_lap: int, stints: list, plan: dict,
+                      fuel_sensor_l: float = None, avg_actual_fpl: float = None) -> dict:
     fpl      = plan['fuel_per_lap_l']
     lap_s    = plan['lap_time_s']
     capacity = plan['fuel_capacity_l']
@@ -308,6 +338,16 @@ def _calc_live_status(current_lap: int, stints: list, plan: dict) -> dict:
     planned_pit     = current_stint.get('pit_lap')
     laps_until_pit  = (planned_pit or current_stint['end_lap']) - current_lap
     last_safe       = current_lap + max(int(math.floor(laps_of_fuel)) - 1, 0)
+
+    # Dynamic override: if we have real fuel data, use sensor-based window
+    if fuel_sensor_l is not None and avg_actual_fpl and avg_actual_fpl > 0:
+        dynamic_laps_of_fuel = fuel_sensor_l / avg_actual_fpl
+        dynamic_laps_until_pit = min(laps_until_pit, int(dynamic_laps_of_fuel) - 1)
+        laps_until_pit = max(dynamic_laps_until_pit, 0)
+        laps_of_fuel = round(dynamic_laps_of_fuel, 1)
+        fuel_remaining = fuel_sensor_l  # use actual sensor reading
+        fuel_pct = round((fuel_sensor_l / capacity) * 100) if capacity > 0 else fuel_pct
+        last_safe = current_lap + max(int(math.floor(laps_of_fuel)) - 1, 0)
 
     pit_status = 'green'
     if planned_pit:
@@ -401,6 +441,7 @@ class TelemetryThread(threading.Thread):
         self._app  = app_ref
         self._stop = threading.Event()
         self._ir   = None  # irsdk instance — set in run() for send_pit_command access
+        self._rival_on_pit_prev: dict = {}  # slot → bool: rival pit road state (Feature 1 v1.1.37)
 
     def stop(self):
         self._stop.set()
@@ -836,7 +877,43 @@ class TelemetryThread(threading.Thread):
                 except Exception as e:
                     self._app.log(f'Opponents parse error: {e}')
 
-                live = _calc_live_status(current_lap, stints, plan) if stints else {}
+                # Read tyre compound
+                tyre_compound = str(ir['PlayerTireCompound'] or '').strip()
+
+                # Read fuel level for dynamic pit window calculation
+                _fuel_for_live  = fuel_raw
+                _fpl_for_live   = (round(sum(fuel_history) / len(fuel_history), 4)
+                                   if len(fuel_history) >= 3 else None)
+                live = (_calc_live_status(current_lap, stints, plan,
+                                          fuel_sensor_l=_fuel_for_live,
+                                          avg_actual_fpl=_fpl_for_live)
+                        if stints else {})
+
+                # Log a note if session time remaining suggests significantly more/fewer laps
+                if time_remain_s and _fpl_for_live and plan.get('lap_time_s', 0) > 0:
+                    _approx_laps_rem = time_remain_s / plan['lap_time_s']
+                    _plan_laps_rem   = (live.get('laps_until_pit') or 0)
+                    if abs(_approx_laps_rem - _plan_laps_rem) > 3 and _plan_laps_rem > 0:
+                        pass  # noted — fuel-based window is authoritative
+
+                # Rival pit tracking (Feature 1 v1.1.37)
+                rival_pit_laps_snapshot = {}
+                try:
+                    for _slot, _on_pit_r in enumerate(car_idx_on_pit):
+                        if _slot == my_car_idx:
+                            continue
+                        _cls_r = car_idx_class[_slot] if _slot < len(car_idx_class) else None
+                        if _cls_r != player_car_class:
+                            continue
+                        _was_r = self._rival_on_pit_prev.get(_slot, False)
+                        if bool(_on_pit_r) and not _was_r:
+                            # Rival entering pit — emit to app
+                            self._app.after(0, lambda s=_slot, l=current_lap:
+                                self._app._on_rival_pit(s, l))
+                        self._rival_on_pit_prev[_slot] = bool(_on_pit_r)
+                    rival_pit_laps_snapshot = dict(self._app._rival_pit_laps)
+                except Exception as _rpe:
+                    self._app.log(f'[RIVAL] Pit tracking error: {_rpe}')
 
                 # Gap to class leader (Feature 8-new)
                 gap_to_leader_s = 0.0
@@ -884,6 +961,10 @@ class TelemetryThread(threading.Thread):
                             'fuel_burn_per_lap': fuel_delta.get('avg_actual_fpl'),
                         },
                         'tire_wear': tire_wear,
+                        'tyre_compound':      tyre_compound,
+                        'car_idx_positions':  list(car_idx_positions),
+                        'car_idx_class':      list(car_idx_class),
+                        'rival_pit_laps':     rival_pit_laps_snapshot,
                     },
                     'damage': {
                         'pit_repair_s':      round(pit_repair_left, 1),
@@ -1161,6 +1242,10 @@ class App(tk.Tk):
         self._caution_lap_announced: int = 0           # F6-new: last announced caution lap
         self._prev_lap_num_caution: int = 0            # F6-new: lap tracker during caution
 
+        # New v1.1.37 feature state
+        self._rival_pit_laps: dict = {}               # F1: slot → lap_num when rival pitted
+        self._compound_laps: int = 0                  # F4: laps completed on current tyre set
+
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
         style.theme_use('clam')
@@ -1231,6 +1316,8 @@ class App(tk.Tk):
         self.v_auto_fuel   = tk.BooleanVar(value=self._cfg.get('auto_fuel', DEFAULTS['auto_fuel']))
         self.v_max_stint_mins = tk.StringVar(
             value=str(self._cfg.get('max_stint_mins', DEFAULTS['max_stint_mins'])))
+        self.v_fuel_safety_laps = tk.StringVar(
+            value=str(self._cfg.get('fuel_safety_laps', DEFAULTS['fuel_safety_laps'])))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue(maxsize=5)
@@ -1539,6 +1626,19 @@ class App(tk.Tk):
                  bg=BG2, fg=DIM, font=('Segoe UI', 8)).grid(
                      row=18, column=2, sticky='w', pady=3, padx=(6, 0))
 
+        # Row 19: Fuel safety margin
+        ttk.Label(frm, text='Fuel safety margin (laps)').grid(row=19, column=0, sticky='w', pady=3, padx=(0, 10))
+        fuel_safety_cb = ttk.Combobox(
+            frm, textvariable=self.v_fuel_safety_laps,
+            values=['1.0', '1.5', '2.0', '2.5', '3.0'],
+            state='readonly', width=8,
+        )
+        fuel_safety_cb.grid(row=19, column=1, sticky='w', pady=3)
+        tk.Label(frm, text='extra laps of fuel buffer loaded each stint',
+                 bg=BG2, fg=DIM, font=('Segoe UI', 8)).grid(
+                     row=19, column=2, sticky='w', pady=3, padx=(6, 0))
+        fuel_safety_cb.bind('<<ComboboxSelected>>', lambda _: self._save_fuel_safety_pref())
+
     def _save_fuel_unit_pref(self):
         self._cfg['fuel_unit'] = self.v_fuel_unit.get()
         save_config(self._cfg)
@@ -1632,6 +1732,15 @@ class App(tk.Tk):
             val = int(float(self.v_max_stint_mins.get()))
             if val >= 0:
                 self._cfg['max_stint_mins'] = val
+                save_config(self._cfg)
+        except (ValueError, TypeError):
+            pass
+
+    def _save_fuel_safety_pref(self):
+        try:
+            val = float(self.v_fuel_safety_laps.get())
+            if 0.5 <= val <= 5.0:
+                self._cfg['fuel_safety_laps'] = val
                 save_config(self._cfg)
         except (ValueError, TypeError):
             pass
@@ -3167,6 +3276,19 @@ class App(tk.Tk):
         except Exception as e:
             self.log(f'[TRANSCRIPT] Save error: {e}')
 
+    def _on_rival_pit(self, slot: int, lap_num: int):
+        """Called on main thread when a same-class rival enters pit road (Feature 1 v1.1.37)."""
+        self._rival_pit_laps[slot] = lap_num
+        with self._ctx_lock:
+            ctx = self._ctx
+        if not ctx:
+            return
+        car_positions = ctx.get('telemetry', {}).get('car_idx_positions', [])
+        rival_pos = car_positions[slot] if slot < len(car_positions) else None
+        if rival_pos and rival_pos > 0:
+            self._say(f'rival_pit_{slot}', f"P{rival_pos} is in the pits", 10)
+            self.log(f'[RIVAL] P{rival_pos} (slot {slot}) pitted on lap {lap_num}')
+
     def _on_opponent_pit_exit(self, opp_name: str, opp_position: int, pit_entry_lap: int):
         """Fired when a nearby opponent exits the pits. Alerts and triggers strategy coaching."""
         if not self._running:
@@ -3278,6 +3400,24 @@ class App(tk.Tk):
             recent_stops.append(f"{entry['duration_s']:.1f}s stop ({'+'.join(entry['services']) or 'unknown services'})")
         stops_str = '; '.join(recent_stops) if recent_stops else 'none this session'
 
+        # Build rival pit history string for strategy context
+        rival_pit_str = ''
+        if self._rival_pit_laps:
+            _rp_plan = plan
+            _est_lps = int(_rp_plan.get('fuel_capacity_l', 50) /
+                           max(_rp_plan.get('fuel_per_lap_l', 2), 0.1))
+            _rp_lines = []
+            _car_positions_rp = tele.get('car_idx_positions', [])
+            for _slot, _pit_lap in self._rival_pit_laps.items():
+                _pos_rp = (_car_positions_rp[_slot]
+                           if _slot < len(_car_positions_rp) else None)
+                if _pos_rp and _pos_rp > 0:
+                    _rp_lines.append(
+                        f"P{_pos_rp} pitted lap {_pit_lap}, next ~lap {_pit_lap + _est_lps}"
+                    )
+            if _rp_lines:
+                rival_pit_str = f"\nRIVAL PIT HISTORY: {'; '.join(_rp_lines)}"
+
         situation = (
             f"LAP: {current_lap} | POSITION: P{my_pos}\n"
             f"GAP: {gap_ahead_str} | {gap_behind_str}\n"
@@ -3285,6 +3425,7 @@ class App(tk.Tk):
             f"{laps_until_pit} laps away, status {pit_status}\n"
             f"FUEL: {fuel_str}\n"
             f"RECENT PIT STOPS THIS SESSION: {stops_str}"
+            f"{rival_pit_str}"
         )
         question = (
             "Should I pit this lap, extend my stint, or is there no strategic advantage either way? "
@@ -3348,7 +3489,12 @@ class App(tk.Tk):
             if next_driver and next_driver != curr_driver:
                 parts.append(f"Driver change — {next_driver} gets in.")
             if fuel_str:
-                parts.append(f"Taking {fuel_str}.")
+                _fuel_load_l = ns.get('fuel_load') or 0
+                _capacity_l  = self._plan.get('fuel_capacity_l', 0)
+                if _capacity_l and _fuel_load_l and (_capacity_l - _fuel_load_l) > 0.5:
+                    parts.append(f"Loading {fuel_str} — minimum to make it.")
+                else:
+                    parts.append(f"Taking {fuel_str}.")
 
         if my_pos:
             parts.append(f"Currently P{my_pos}.")
@@ -3686,6 +3832,8 @@ class App(tk.Tk):
         self._caution_laps           = 0
         self._caution_lap_announced  = 0
         self._prev_lap_num_caution   = 0
+        self._rival_pit_laps         = {}
+        self._compound_laps          = 0
 
         self._stop_evt.clear()
         self._running = True
@@ -4127,6 +4275,29 @@ class App(tk.Tk):
                             if self._say('tyre_warning', _tw_msg, 300):
                                 self.log(f'[TYRE] {_tw_msg}')
 
+            # Compound tyre life alerts (Feature 4 v1.1.37)
+            if not is_quali_session and not coaching_suppressed:
+                _compound_raw = tele.get('tyre_compound', '').lower()
+                _cat = COMPOUND_CATEGORY.get(_compound_raw, '')
+                if _cat:
+                    _expected_life = self._cfg.get(
+                        'compound_life', DEFAULTS['compound_life']).get(_cat, 0)
+                    if _expected_life > 0 and self._compound_laps > 0:
+                        _laps_rem_compound = _expected_life - self._compound_laps
+                        if _laps_rem_compound == 5:
+                            self._say('compound_5',
+                                      f"Five laps on {_cat}s — approaching compound life limit",
+                                      300)
+                        elif _laps_rem_compound == 2:
+                            self._say('compound_2',
+                                      f"Two laps left on {_cat}s — plan your pit",
+                                      120)
+                        elif _laps_rem_compound <= 0:
+                            self._say('compound_over',
+                                      f"{_cat.capitalize()} tyres past expected life — "
+                                      f"tyre performance degraded",
+                                      300)
+
             fd       = tele.get('fuel_delta', {})
             avg_fpl  = fd.get('avg_actual_fpl')
             plan_fpl = ctx.get('plan', {}).get('fuel_per_lap_l')
@@ -4205,6 +4376,8 @@ class App(tk.Tk):
                 self._auto_fuel_set = False
                 # Feature 4 (v1.1.36): reset stint start time on pit exit
                 self._stint_start_time = time.time()
+                # Feature 4 (v1.1.37): reset compound lap counter on pit exit
+                self._compound_laps = 0
                 # Feature 4 (v1.1.36): Post-pit fuel confirmation
                 try:
                     _fuel_confirm = tele.get('fuel_level')
@@ -4284,7 +4457,8 @@ class App(tk.Tk):
                     _fuel_rem  = _tele_af.get('fuel', {}).get('fuel_remaining_l') or \
                                  _tele_af.get('fuel_level')
                     if _fuel_burn and _fuel_rem is not None and _laps_pit > 0:
-                        _fuel_to_add = max(0, _laps_pit * _fuel_burn - _fuel_rem + 1.0)
+                        _safety_laps = self._cfg.get('fuel_safety_laps', DEFAULTS['fuel_safety_laps'])
+                        _fuel_to_add = max(0, (_laps_pit + _safety_laps) * _fuel_burn - _fuel_rem)
                         _fuel_litres = int(math.ceil(_fuel_to_add))
                         if 0 < _fuel_litres < 120:
                             self._auto_fuel_set = True
@@ -5255,6 +5429,43 @@ class App(tk.Tk):
             if gap_leader and gap_leader > 0:
                 lines.append(f"GAP TO CLASS LEADER: {gap_leader:.1f}s")
 
+        # Rival pit history (Feature 1 v1.1.37)
+        if self._rival_pit_laps:
+            _rpl_plan = ctx.get('plan', {})
+            _est_laps_per_stint = int(
+                _rpl_plan.get('fuel_capacity_l', 50) /
+                max(_rpl_plan.get('fuel_per_lap_l', 2), 0.1)
+            )
+            rival_lines = []
+            for _slot, _pit_lap in self._rival_pit_laps.items():
+                _predicted_next = _pit_lap + _est_laps_per_stint
+                _car_positions  = tele.get('car_idx_positions', [])
+                _pos = _car_positions[_slot] if _slot < len(_car_positions) else None
+                if _pos and _pos > 0:
+                    rival_lines.append(
+                        f"P{_pos} pitted lap {_pit_lap}, "
+                        f"predicted next stop ~lap {_predicted_next}"
+                    )
+            if rival_lines:
+                lines.append("RIVAL PIT HISTORY: " + "; ".join(rival_lines))
+
+        # Compound tyre info (Feature 4 v1.1.37)
+        _tyre_compound_sp = tele.get('tyre_compound', '')
+        if _tyre_compound_sp:
+            _cat_sp = COMPOUND_CATEGORY.get(_tyre_compound_sp.lower(), '')
+            _exp_life_sp = self._cfg.get(
+                'compound_life', DEFAULTS['compound_life']).get(_cat_sp, 0)
+            if _exp_life_sp > 0:
+                lines.append(
+                    f"TYRES: {_tyre_compound_sp} ({_cat_sp}), "
+                    f"lap {self._compound_laps} of ~{_exp_life_sp} expected"
+                )
+            else:
+                lines.append(
+                    f"TYRES: {_tyre_compound_sp}, "
+                    f"lap {self._compound_laps} on current set"
+                )
+
         if self._pit_stop_log:
             last_ps     = self._pit_stop_log[-1]
             planned_pl  = plan.get('pit_loss_s', 35)
@@ -5399,6 +5610,10 @@ class App(tk.Tk):
             self._did_pit_this_lap = False
         else:
             self._stint_lap += 1
+
+        # Feature 4 v1.1.37 — Compound laps (not on in/out-laps; reset on pit exit)
+        if not is_inlap and not is_outlap:
+            self._compound_laps += 1
         _scl = self._cfg.get('stint_callout_laps', DEFAULTS['stint_callout_laps'])
         if (not is_quali
                 and _scl and self._stint_lap > 0 and self._stint_lap % _scl == 0):
@@ -5607,6 +5822,24 @@ class App(tk.Tk):
                 if _cold:
                     deg_str += f" Tyre temps still cold on {', '.join(c for c, _ in _cold)} — build heat."
 
+        # Feature 4 v1.1.37 — Compound tyre life coaching note
+        compound_str = ''
+        with self._ctx_lock:
+            _ctx_cmp = self._ctx
+        _compound_lc = (_ctx_cmp or {}).get('telemetry', {}).get('tyre_compound', '') if _ctx_cmp else ''
+        if _compound_lc:
+            _cat_lc = COMPOUND_CATEGORY.get(_compound_lc.lower(), '')
+            _exp_lc = self._cfg.get('compound_life', DEFAULTS['compound_life']).get(_cat_lc, 0)
+            if _exp_lc > 0:
+                compound_str = (
+                    f" TYRES: {_compound_lc} ({_cat_lc}), "
+                    f"lap {self._compound_laps} of ~{_exp_lc} expected."
+                )
+            else:
+                compound_str = (
+                    f" TYRES: {_compound_lc}, lap {self._compound_laps} on current set."
+                )
+
         # Handling tendencies string — suppress brake bias recs for 8 laps after one is given
         HANDLING_COOLDOWN = 8
         handling_str = ''
@@ -5697,7 +5930,8 @@ class App(tk.Tk):
         else:
             question = (
                 f"Lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
-                f"{fpl_str}{reason}.{sector_str}{consistency_str}{deg_str}{handling_str}{track_hint}"
+                f"{fpl_str}{reason}.{sector_str}{consistency_str}{deg_str}{handling_str}"
+                f"{compound_str}{track_hint}"
                 f"{rival_str}{mode_str} "
                 f"Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
                 f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
