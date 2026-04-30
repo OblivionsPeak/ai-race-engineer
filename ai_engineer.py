@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.32"
+VERSION     = "1.1.33"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -626,13 +626,27 @@ class TelemetryThread(threading.Thread):
                                     self._app._on_car_detected(c))
                             break
 
-                # Rival P1 last lap time (Feature 3)
-                car_idx_last_lap = ir['CarIdxLastLapTime'] or []
-                rival_p1_last_lap = 0.0
+                # Multi-class awareness (Feature 4)
+                car_idx_last_lap  = ir['CarIdxLastLapTime']   or []
+                car_idx_class     = ir['CarIdxClass']          or []
+                car_idx_class_pos = ir['CarIdxClassPosition']  or []
+                player_car_class  = ir['PlayerCarClass']        or 0
+
+                rival_p1_last_lap    = 0.0
+                player_class_position = 0
                 try:
-                    if car_idx_positions and car_idx_last_lap:
-                        for _ci2, _pos2 in enumerate(car_idx_positions):
-                            if _pos2 == 1 and _ci2 != my_car_idx:
+                    if car_idx_class_pos and my_car_idx < len(car_idx_class_pos):
+                        player_class_position = int(car_idx_class_pos[my_car_idx] or 0)
+                except Exception:
+                    pass
+                try:
+                    if car_idx_class and car_idx_class_pos and car_idx_last_lap:
+                        for _ci2 in range(len(car_idx_class)):
+                            if _ci2 == my_car_idx:
+                                continue
+                            _cls = car_idx_class[_ci2] if _ci2 < len(car_idx_class) else None
+                            _cpos = car_idx_class_pos[_ci2] if _ci2 < len(car_idx_class_pos) else None
+                            if _cls == player_car_class and _cpos == 1:
                                 _t = car_idx_last_lap[_ci2] if _ci2 < len(car_idx_last_lap) else 0.0
                                 if _t and _t > 0:
                                     rival_p1_last_lap = float(_t)
@@ -789,7 +803,13 @@ class TelemetryThread(threading.Thread):
                         'stale':              False,
                         'car_idx_f2time':     list(car_idx_f2time),
                         'player_car_idx':     my_car_idx,
-                        'rival_p1_last_lap':  rival_p1_last_lap,
+                        'rival_p1_last_lap':    rival_p1_last_lap,
+                        'player_class_position': player_class_position,
+                        'fuel': {
+                            'fuel_remaining_l': round(fuel, 3) if fuel is not None else None,
+                            'fuel_burn_per_lap': fuel_delta.get('avg_actual_fpl'),
+                        },
+                        'tire_wear': tire_wear,
                     },
                     'damage': {
                         'pit_repair_s':      round(pit_repair_left, 1),
@@ -822,6 +842,11 @@ class TelemetryThread(threading.Thread):
                         'meatball':   bool(session_flags & 0x40000),  # irsdk_serviceable
                     },
                 }
+
+                # Store tyre wear and class position for broadcast frame (slow-changing data)
+                if any(v is not None for v in tire_wear.values()):
+                    self._app._tele_frame_tw = tire_wear
+                self._app._tele_frame_cp = player_class_position
 
                 with self._app._ctx_lock:
                     self._app._ctx = ctx
@@ -1024,6 +1049,8 @@ class App(tk.Tk):
         self._vad_thread: threading.Thread | None = None
         # Pit wall broadcast state
         self._tele_frame: dict = {}
+        self._tele_frame_tw: dict = {}  # tyre wear for broadcast frame (updated in slow path)
+        self._tele_frame_cp: int = 0    # class position for broadcast frame (updated in slow path)
         self._tele_lap_buf: list = []   # frames accumulated for the current lap
         self._tele_best_lap_s: float = 0.0
         self._broadcast_thread: threading.Thread | None = None
@@ -1039,6 +1066,7 @@ class App(tk.Tk):
         self._did_pit_this_lap: bool = False       # Feature 4: pit detected this lap
         self._driving_mode: str = 'normal'         # Feature 5: push/conserve mode
         self._current_car_path: str = ''           # Feature 8: per-car config
+        self._tyre_wear_by_lap: dict = {}          # Feature 6: per-lap tyre wear tracking
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -2648,6 +2676,24 @@ class App(tk.Tk):
                 )
             except Exception:
                 pass
+            # Integration Fix A — also post class leader lap when available
+            try:
+                _rival = self._ctx.get('telemetry', {}).get('rival_p1_last_lap', 0.0) if self._ctx else 0.0
+                _pos   = position or 0
+                if _rival and _rival > 0 and _pos > 1 and self._server_session_id:
+                    requests.post(
+                        f'{BACKEND_URL}/engineer/session/leader_lap',
+                        json={
+                            'token':      token,
+                            'session_id': self._server_session_id,
+                            'lap_num':    lap_num,
+                            'lap_time_s': _rival,
+                            'car_name':   'Leader',
+                        },
+                        timeout=6,
+                    )
+            except Exception:
+                pass
         threading.Thread(target=_do, daemon=True).start()
 
     def _end_server_session(self):
@@ -2743,6 +2789,29 @@ class App(tk.Tk):
                     f"({avg_under:.1f}% avg per lap over {n_laps_dyn} laps) — consider setup or brake bias adjustment."
                 )
 
+        # Feature 3 — Setup direction hints based on handling data
+        setup_hint_str = ''
+        if self._per_lap_dynamics:
+            _all_over  = [d.get('oversteer', 0) for d in self._per_lap_dynamics.values()]
+            _all_under = [d.get('understeer', 0) for d in self._per_lap_dynamics.values()]
+            _avg_over  = sum(_all_over)  / len(_all_over)  if _all_over  else 0
+            _avg_under = sum(_all_under) / len(_all_under) if _all_under else 0
+            if _avg_over > _avg_under * 1.5 and _avg_over > 3:
+                setup_hint_str = (' Based on handling data, suggest 1-2 specific car setup adjustments '
+                                  'to reduce oversteer (e.g. stiffen rear ARB, reduce rear wing, add front downforce).')
+            elif _avg_under > _avg_over * 1.5 and _avg_under > 3:
+                setup_hint_str = (' Based on handling data, suggest 1-2 specific car setup adjustments '
+                                  'to reduce understeer (e.g. soften front ARB, add front wing, reduce front ride height).')
+
+        # Tyre wear summary for debrief (Feature 6)
+        tyre_debrief_str = ''
+        if self._tyre_wear_by_lap:
+            _last_tw_lap = self._tyre_wear_by_lap[max(self._tyre_wear_by_lap)]
+            _tw_vals_d   = [v for v in _last_tw_lap.values() if v is not None]
+            if _tw_vals_d:
+                _avg_final_tread = sum(_tw_vals_d) / len(_tw_vals_d)
+                tyre_debrief_str = f" End-of-session tyre wear: {_avg_final_tread*100:.0f}% average remaining."
+
         # Consistency across the session
         consistency_summary_str = ''
         if len(times) >= 4:
@@ -2762,11 +2831,12 @@ class App(tk.Tk):
             f"{total_laps} laps total. Best: {self._fmt_lap_spoken(best)}. "
             f"Avg (last {n}): {self._fmt_lap_spoken(avg)}. "
             f"Pace trend: {trend_word} ({trend:+.2f}s first 5 vs last 5 of sample)."
-            f"{sector_summary_str}{handling_summary_str}{consistency_summary_str}{track_debrief_hint} "
+            f"{sector_summary_str}{handling_summary_str}{consistency_summary_str}"
+            f"{tyre_debrief_str}{track_debrief_hint} "
             f"Incidents: {incidents}. Stints: {stints_done}. Avg fuel: {avg_fpl_str}. "
             f"Give 3-4 sentences: one on overall pace, one on the weakest area to focus on "
             f"next time (use sector and handling data to be specific), one on any setup or "
-            f"technique recommendation. Do not repeat the lap time."
+            f"technique recommendation. Do not repeat the lap time.{setup_hint_str}"
         )
         self.log('[DEBRIEF] Generating session debrief…')
 
@@ -3101,14 +3171,29 @@ class App(tk.Tk):
         """Fires on main thread when a sector split is captured vs session best."""
         if not self._running:
             return
-        if delta < -0.15:
-            msg = f"Purple {sector}"
-        elif delta < 0.0:
-            msg = f"Green {sector}, {delta:+.2f}"
-        elif delta < 0.4:
-            msg = f"{sector}: {delta:+.2f}"
+        # Check if we are in qualifying — tighter thresholds apply
+        with self._ctx_lock:
+            _ctx_s = self._ctx
+        _sess_type = (_ctx_s or {}).get('session', {}).get('type', '').lower()
+        is_quali_now = _sess_type in self._QUALI_SESSION_TYPES
+        if is_quali_now:
+            if delta < -0.05:
+                msg = f"Purple {sector}"
+            elif delta < 0.0:
+                msg = f"Green {sector}, {delta:+.2f}"
+            elif delta < 0.2:
+                msg = f"{sector}: {delta:+.2f}"
+            else:
+                msg = f"Lost time in {sector}, {delta:+.2f}"
         else:
-            msg = f"Lost time in {sector}, {delta:+.2f}"
+            if delta < -0.15:
+                msg = f"Purple {sector}"
+            elif delta < 0.0:
+                msg = f"Green {sector}, {delta:+.2f}"
+            elif delta < 0.4:
+                msg = f"{sector}: {delta:+.2f}"
+            else:
+                msg = f"Lost time in {sector}, {delta:+.2f}"
         if self._say(f'sector_{sector.lower()}', msg, 5.0):
             self.log(f'[SECTOR] {sector}: {delta:+.3f}s vs session best')
 
@@ -3275,6 +3360,7 @@ class App(tk.Tk):
         self._prev_on_pit_road       = False
         self._stint_lap              = 0
         self._did_pit_this_lap       = False
+        self._tyre_wear_by_lap       = {}
 
         self._stop_evt.clear()
         self._running = True
@@ -3303,6 +3389,8 @@ class App(tk.Tk):
 
         # ── Start threads ─────────────────────────────────────────────────
         self._tele_frame      = {}
+        self._tele_frame_tw   = {}
+        self._tele_frame_cp   = 0
         self._tele_lap_buf    = []
         self._tele_best_lap_s = 0.0
         self._callout_mgr = CalloutManager(self.speak, lambda msg: self.log(f'[CALLOUT] {msg}'))
@@ -3485,10 +3573,13 @@ class App(tk.Tk):
             pit_optimal     = live.get('pit_window_optimal', '?')
             current_lap_now = tele.get('current_lap', 0) or 0
             sess_type_now   = ctx.get('session', {}).get('type', '')
+            is_quali_session = sess_type_now.lower() in self._QUALI_SESSION_TYPES
 
             # Fuel warning — only fire when we have 3+ measured laps to avoid plan-estimate false alarms
+            # Skip in qualifying — fuel is not a concern
             fuel_laps_measured = tele.get('fuel_laps_measured', 0)
-            if (laps_of_fuel is not None
+            if (not is_quali_session
+                    and laps_of_fuel is not None
                     and laps_of_fuel <= warn_laps
                     and fuel_laps_measured >= 3):
                 msg = (
@@ -3500,15 +3591,18 @@ class App(tk.Tk):
                     self._last_fuel_alert = now
 
             # Approaching pit window — speak alert then fire strategy call
-            if laps_until_pit is not None and 0 < laps_until_pit <= 2:
+            # Skip in qualifying
+            if (not is_quali_session
+                    and laps_until_pit is not None and 0 < laps_until_pit <= 2):
                 msg = f"Approaching pit window. {laps_until_pit} laps to pit."
                 if self._say('pit_window', msg, 60):
                     self.log(f'[ALERT] {msg}')
                     self._last_pit_alert = now
 
-            # Pre-pit briefing — fires once on the pit lap itself
+            # Pre-pit briefing — fires once on the pit lap itself (not in quali)
             current_stint_num = live.get('current_stint', {}).get('stint_num', 0) or 0
-            if (laps_until_pit is not None and laps_until_pit <= 0
+            if (not is_quali_session
+                    and laps_until_pit is not None and laps_until_pit <= 0
                     and pit_status != 'red'
                     and current_stint_num > self._last_pit_briefed_stint
                     and not tele.get('on_pit_road')):
@@ -3517,8 +3611,10 @@ class App(tk.Tk):
 
             # Fuel save coaching — fires when driver won't make pit window on current burn
             # Feature 5: conserve mode lowers threshold (fires even with small margin deficit)
+            # Skip in qualifying
             _fuel_save_margin = 0.5 if self._driving_mode == 'conserve' else 0.0
-            if (not coaching_suppressed
+            if (not is_quali_session
+                    and not coaching_suppressed
                     and fuel_laps_measured >= 3
                     and laps_until_pit is not None and laps_until_pit > 0
                     and laps_of_fuel is not None
@@ -3536,9 +3632,11 @@ class App(tk.Tk):
                     ).start()
 
             # Pit window countdown alerts — 5, 3, 2 laps out (before AI strategy fires at ≤1)
-            if (not coaching_suppressed
+            # Skip in qualifying
+            if (not is_quali_session
+                    and not coaching_suppressed
                     and laps_until_pit is not None and pit_status in ('green', 'yellow')
-                    and sess_type_now.lower() in ('race', 'feature race', 'heat race', 'lone qualify')
+                    and sess_type_now.lower() in ('race', 'feature race', 'heat race')
                     and not tele.get('on_pit_road')):
                 _alert = self._last_pit_window_alert_laps
                 if laps_until_pit == 5 and _alert > 5:
@@ -3555,10 +3653,12 @@ class App(tk.Tk):
                     self._last_pit_window_alert_laps = 2
 
             # Proactive pit strategy — fires once when window opens (laps_until_pit == 0 or 1)
-            if (not coaching_suppressed
+            # Skip in qualifying
+            if (not is_quali_session
+                    and not coaching_suppressed
                     and pit_status in ('open', 'green')
                     and laps_until_pit is not None and laps_until_pit <= 1
-                    and sess_type_now.lower() in ('race', 'feature race', 'heat race', 'lone qualify')
+                    and sess_type_now.lower() in ('race', 'feature race', 'heat race')
                     and current_lap_now > self._last_strategy_lap + 3
                     and not self._coaching_in_flight):
                 self._last_strategy_lap = current_lap_now
@@ -3566,24 +3666,25 @@ class App(tk.Tk):
                     target=self._ask_pit_strategy, args=('pit_window_opened',), daemon=True
                 ).start()
 
-            if pit_status == 'red':
+            if not is_quali_session and pit_status == 'red':
                 msg = "Overdue for pit stop. You are past the planned pit lap."
                 if self._say('pit_overdue', msg, 120):
                     self.log(f'[ALERT] {msg}')
                     self._last_overdue_alert = now
 
             # Weather / track evolution alerts (advisory — suppressed by ack)
+            # Skip in qualifying
             weather = ctx.get('weather', {})
             wet_now     = weather.get('wet', False)
             wetness_now = weather.get('track_wetness', 0)
-            if not coaching_suppressed and wet_now != self._last_weather_declared_wet:
+            if not is_quali_session and not coaching_suppressed and wet_now != self._last_weather_declared_wet:
                 msg = ("Session declared wet — wet tyres now permitted."
                        if wet_now else "Session changed to dry conditions.")
                 if self._say('weather_declared_wet', msg, 30):
                     self.log(f'[WEATHER] {msg}')
                     self._last_weather_declared_wet = wet_now
                     self._last_weather_alert = now
-            elif not coaching_suppressed and wetness_now >= 4 and self._last_track_wetness < 4:
+            elif not is_quali_session and not coaching_suppressed and wetness_now >= 4 and self._last_track_wetness < 4:
                 msg = "Track conditions are getting wet. Consider your pit strategy."
                 if self._say('weather_wet', msg, 60):
                     self.log(f'[WEATHER] {msg}')
@@ -3593,11 +3694,12 @@ class App(tk.Tk):
                 self._last_track_wetness = wetness_now  # track has dried, reset silently
 
             # Track temp change alert — fires when temp shifts ≥5°C from last alerted value
+            # Skip in qualifying
             track_temp_now = weather.get('track_temp_c')
             if track_temp_now is not None:
                 if self._last_track_temp_alerted_c is None:
                     self._last_track_temp_alerted_c = track_temp_now
-                elif not coaching_suppressed \
+                elif not is_quali_session and not coaching_suppressed \
                         and abs(track_temp_now - self._last_track_temp_alerted_c) >= 5.0 \
                         and now - self._last_weather_alert > 120:
                     delta_t = track_temp_now - self._last_track_temp_alerted_c
@@ -3629,7 +3731,7 @@ class App(tk.Tk):
             gap_history = self._gap_history
             ahead_hist  = gap_history.get('ahead', [])
             behind_hist = gap_history.get('behind', [])
-            if not coaching_suppressed and now - self._last_gap_alert > 45:
+            if not is_quali_session and not coaching_suppressed and now - self._last_gap_alert > 45:
                 opp = tele.get('opponents', {})
                 if len(behind_hist) >= 5:
                     behind_delta = behind_hist[-1] - behind_hist[-5]
@@ -3662,11 +3764,50 @@ class App(tk.Tk):
             if my_pos_now is not None:
                 self._prev_position = my_pos_now
 
+            # Tyre wear alert (Feature 6)
+            if not coaching_suppressed:
+                _tw_alert = tele.get('tire_wear', {})
+                _tw_vals  = [v for v in _tw_alert.values() if v is not None]
+                if _tw_vals:
+                    _avg_tread = sum(_tw_vals) / len(_tw_vals)
+                    if _avg_tread < 0.25:
+                        # Determine which axle is worse
+                        _lf = _tw_alert.get('LF') or 1.0
+                        _rf = _tw_alert.get('RF') or 1.0
+                        _lr = _tw_alert.get('LR') or 1.0
+                        _rr = _tw_alert.get('RR') or 1.0
+                        _front_avg = (_lf + _rf) / 2
+                        _rear_avg  = (_lr + _rr) / 2
+                        _axle = 'fronts' if _front_avg <= _rear_avg else 'rears'
+                        # Estimate laps remaining from fastest-wearing corner
+                        _laps_est = None
+                        if len(self._tyre_wear_by_lap) >= 2:
+                            _sorted_laps = sorted(self._tyre_wear_by_lap)
+                            _prev_lap_data = self._tyre_wear_by_lap[_sorted_laps[-2]]
+                            _curr_lap_data = self._tyre_wear_by_lap[_sorted_laps[-1]]
+                            _deg_per_lap_vals = []
+                            for _corner in ('LF', 'RF', 'LR', 'RR'):
+                                _p = _prev_lap_data.get(_corner)
+                                _c = _curr_lap_data.get(_corner)
+                                if _p is not None and _c is not None and _p > _c:
+                                    _deg_per_lap_vals.append(_p - _c)
+                            if _deg_per_lap_vals:
+                                _max_deg = max(_deg_per_lap_vals)
+                                if _max_deg > 0:
+                                    _min_tread = min(_tw_vals)
+                                    _laps_est = _min_tread / _max_deg
+                        if _laps_est is None or _laps_est > 5:
+                            _tw_msg = (f"Tyre warning — {_axle} are heavily worn "
+                                       f"({_avg_tread*100:.0f}% average remaining).")
+                            if self._say('tyre_warning', _tw_msg, 300):
+                                self.log(f'[TYRE] {_tw_msg}')
+
             fd       = tele.get('fuel_delta', {})
             avg_fpl  = fd.get('avg_actual_fpl')
             plan_fpl = ctx.get('plan', {}).get('fuel_per_lap_l')
             fuel_laps_measured = tele.get('fuel_laps_measured', 0)
-            if (avg_fpl and plan_fpl and plan_fpl > 0 and fuel_laps_measured >= 3
+            if (not is_quali_session
+                    and avg_fpl and plan_fpl and plan_fpl > 0 and fuel_laps_measured >= 3
                     and now - self._last_fuel_diverge_alert > 300):
                 diverge_pct = abs(avg_fpl - plan_fpl) / plan_fpl * 100
                 if diverge_pct >= 15:
@@ -3886,17 +4027,32 @@ class App(tk.Tk):
         """Push one telemetry frame to the backend every 50 ms (20 fps)."""
         token = self._cfg.get('token', '')
         while not self._stop_evt.is_set() and self._running:
-            frame = self._tele_frame
+            frame = dict(self._tele_frame)  # snapshot to avoid mutation during POST
             sid   = self._server_session_id
             if frame and sid and token:
                 with self._ctx_lock:
                     ctx = self._ctx
+                # Extend frame with slow-changing data (tyre wear, class position)
+                _tw = self._tele_frame_tw
+                if _tw:
+                    frame['tw'] = _tw
+                _cp = self._tele_frame_cp
+                if _cp:
+                    frame['cp'] = _cp
                 meta = None
                 if ctx:
+                    _tele_ctx = ctx.get('telemetry', {})
+                    _fuel_ctx = _tele_ctx.get('fuel', {})
+                    _tw_ctx   = _tele_ctx.get('tire_wear', {})
+                    fuel_remaining_l  = _fuel_ctx.get('fuel_remaining_l')
+                    fuel_burn_per_lap = _fuel_ctx.get('fuel_burn_per_lap')
                     meta = {
-                        'track':       ctx.get('plan', {}).get('track', ''),
-                        'car':         ctx.get('plan', {}).get('car', ''),
-                        'driver_name': self._display_name or '',
+                        'track':            ctx.get('plan', {}).get('track', ''),
+                        'car':              ctx.get('plan', {}).get('car', ''),
+                        'driver_name':      self._display_name or '',
+                        'fuel_remaining':   fuel_remaining_l,
+                        'fuel_burn_per_lap': fuel_burn_per_lap,
+                        'tire_wear':        _tw_ctx,
                     }
                 try:
                     requests.post(
@@ -4622,23 +4778,37 @@ class App(tk.Tk):
         pos = tele_snap.get('opponents', {}).get('my_position')
         self._record_server_lap(lap_num, lap_time, fpl, pos)
 
-        # Feature 4 — Stint lap counter
+        is_quali = st in self._QUALI_SESSION_TYPES
+
+        # Feature 4 — Stint lap counter (skip callout in qualifying)
         if self._did_pit_this_lap:
             self._stint_lap = 1
             self._did_pit_this_lap = False
         else:
             self._stint_lap += 1
         _scl = self._cfg.get('stint_callout_laps', DEFAULTS['stint_callout_laps'])
-        if _scl and self._stint_lap > 0 and self._stint_lap % _scl == 0:
+        if (not is_quali
+                and _scl and self._stint_lap > 0 and self._stint_lap % _scl == 0):
             self._say(f'stint_lap_{self._stint_lap}',
                       f"Lap {self._stint_lap} of your stint.", 0)
 
-        # Feature 3 — Rival P1 lap tracking context (folded into coaching below)
+        # Feature 6 — Store tyre wear for this lap and calculate degradation
+        _tw_snap = tele_snap.get('tire_wear', {})
+        if any(v is not None for v in _tw_snap.values()):
+            self._tyre_wear_by_lap[lap_num] = dict(_tw_snap)
+            if len(self._tyre_wear_by_lap) > 20:
+                del self._tyre_wear_by_lap[min(self._tyre_wear_by_lap)]
+
+        # Feature 3 / 4 — Rival class P1 lap tracking context (folded into coaching below)
         rival_p1_time = tele_snap.get('rival_p1_last_lap', 0.0)
 
         is_pb = (lap_time == self._session_best_lap and len(self._lap_times_this_session) > 1)
         recent = self._lap_times_this_session[-5:]
         avg    = sum(recent) / len(recent) if recent else lap_time
+
+        # Feature 2 — In qualifying, announce personal best immediately
+        if is_quali and is_pb:
+            self._say('quali_pb', "Personal best!", 0)
 
         # Feature 5 — push mode tightens the "slow" threshold
         _slow_threshold = 0.2 if self._driving_mode == 'push' else 0.5
@@ -4672,7 +4842,10 @@ class App(tk.Tk):
         # Speak the lap time immediately so the driver hears it without network delay
         spoken_time = self._fmt_lap_spoken(lap_time)
         if is_pb:
-            self._say(f'lap_{lap_num}', f"Lap {lap_num}, {spoken_time}. New session best.", 0)
+            if not is_quali:  # quali PB already announced above
+                self._say(f'lap_{lap_num}', f"Lap {lap_num}, {spoken_time}. New session best.", 0)
+            else:
+                self._say(f'lap_{lap_num}', f"Lap {lap_num}, {spoken_time}.", 0)
         elif is_slow:
             self._say(f'lap_{lap_num}', f"Lap {lap_num}, {spoken_time}.", 0)
         else:
@@ -4688,7 +4861,8 @@ class App(tk.Tk):
                   self._lap_sector_deltas.get(lap_num),
                   self._per_lap_dynamics.get(lap_num),
                   rival_p1_time,
-                  self._driving_mode),
+                  self._driving_mode,
+                  dict(self._tyre_wear_by_lap)),
             daemon=True,
         ).start()
 
@@ -4696,7 +4870,8 @@ class App(tk.Tk):
                           session_type: str = '', sector_deltas: dict | None = None,
                           lap_dynamics: dict | None = None,
                           rival_p1_last_lap: float = 0.0,
-                          driving_mode: str = 'normal'):
+                          driving_mode: str = 'normal',
+                          tyre_wear_by_lap: dict | None = None):
         recent   = self._lap_times_this_session[-5:]
         avg      = sum(recent) / len(recent) if recent else lap_time
         imperial = (self._cfg.get('units_system', 'metric') == 'imperial')
@@ -4759,6 +4934,35 @@ class App(tk.Tk):
                     f"not driver error."
                 )
 
+        # Feature 6 — Tyre wear coaching addition
+        if tyre_wear_by_lap and lap_num in tyre_wear_by_lap:
+            _tw_now = tyre_wear_by_lap[lap_num]
+            _tw_vals = [v for v in _tw_now.values() if v is not None]
+            if _tw_vals:
+                _avg_tread = sum(_tw_vals) / len(_tw_vals)
+                if _avg_tread < 0.5:
+                    # Calculate deg rate from previous lap if available
+                    _sorted_tw_laps = sorted(tyre_wear_by_lap)
+                    _prev_laps = [ln for ln in _sorted_tw_laps if ln < lap_num]
+                    _deg_pct_per_lap = None
+                    if _prev_laps:
+                        _prev_tw = tyre_wear_by_lap[_prev_laps[-1]]
+                        _deg_vals = []
+                        for _corner in ('LF', 'RF', 'LR', 'RR'):
+                            _p = _prev_tw.get(_corner)
+                            _c = _tw_now.get(_corner)
+                            if _p is not None and _c is not None and _p > _c:
+                                _deg_vals.append((_p - _c) * 100)
+                        if _deg_vals:
+                            _deg_pct_per_lap = sum(_deg_vals) / len(_deg_vals)
+                    if _deg_pct_per_lap is not None:
+                        deg_str += (
+                            f" Tyre wear: {_avg_tread*100:.0f}% avg remaining, "
+                            f"degrading ~{_deg_pct_per_lap:.1f}%/lap."
+                        )
+                    else:
+                        deg_str += f" Tyre wear: {_avg_tread*100:.0f}% avg remaining."
+
         # Handling tendencies string — suppress brake bias recs for 8 laps after one is given
         HANDLING_COOLDOWN = 8
         handling_str = ''
@@ -4798,20 +5002,21 @@ class App(tk.Tk):
             f"when coaching sector-specific issues, name the relevant corners."
         ) if (track_name and sector_deltas) else ''
 
-        # Feature 3 — rival P1 context string
+        # Feature 3 / 4 — class leader context string
         rival_str = ''
         _pos = None
         with self._ctx_lock:
             _ctx_r = self._ctx
         if _ctx_r:
-            _pos = _ctx_r.get('telemetry', {}).get('opponents', {}).get('my_position')
+            _pos = _ctx_r.get('telemetry', {}).get('player_class_position') or \
+                   _ctx_r.get('telemetry', {}).get('opponents', {}).get('my_position')
         if rival_p1_last_lap and rival_p1_last_lap > 0 and lap_time > 0 and (_pos is None or _pos > 1):
             _rival_delta = lap_time - rival_p1_last_lap
             if _rival_delta > 0.5:
-                rival_str = (f" Leader last lap: {self._fmt_lap_spoken(rival_p1_last_lap)},"
+                rival_str = (f" Class leader last lap: {self._fmt_lap_spoken(rival_p1_last_lap)},"
                              f" you are {_rival_delta:.1f}s slower.")
             elif _rival_delta < -0.5:
-                rival_str = (f" You are {abs(_rival_delta):.1f}s faster than the leader's"
+                rival_str = (f" You are {abs(_rival_delta):.1f}s faster than the class leader's"
                              f" last lap ({self._fmt_lap_spoken(rival_p1_last_lap)}).")
 
         # Feature 5 — driving mode context string
