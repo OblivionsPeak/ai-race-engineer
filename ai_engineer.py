@@ -472,6 +472,7 @@ class TelemetryThread(threading.Thread):
         last_engine_warnings    = 0      # track new engine warning bits
         last_meatball           = False  # track meatball (serviceable) flag transitions
         fast_tick               = 0      # counts fast-path iterations to gate slow path
+        just_reconnected        = True   # absorb initial flag state silently on first tick after connect
 
         # Per-connection mutable state (reset implicitly on reconnect)
         sector_s1_delta: float | None = None  # delta vs session best at ~33% of lap
@@ -507,6 +508,7 @@ class TelemetryThread(threading.Thread):
                     self._app.set_status('connecting')
                     auto_plan_detected = False
                     car_detected = False
+                    just_reconnected = True
                     # Mark existing ctx stale so the AI knows telemetry is unavailable
                     with self._app._ctx_lock:
                         if self._app._ctx:
@@ -598,16 +600,22 @@ class TelemetryThread(threading.Thread):
 
                 # Meatball flag (irsdk_serviceable = 0x40000) — mechanical issue
                 meatball_now = bool(session_flags & 0x40000)
-                if meatball_now and not last_meatball:
-                    self._app.after(0, self._app._on_meatball_flag)
-                last_meatball = meatball_now
+                if just_reconnected:
+                    # Absorb current state silently — don't treat pre-existing flags as new events
+                    last_meatball        = meatball_now
+                    last_engine_warnings = engine_warnings_raw
+                    just_reconnected     = False
+                else:
+                    if meatball_now and not last_meatball:
+                        self._app.after(0, self._app._on_meatball_flag)
+                    last_meatball = meatball_now
 
-                # Engine warning alerts — fire on new bits, not every tick
-                new_warn_bits = engine_warnings_raw & ~last_engine_warnings
-                if new_warn_bits and is_on_track:
-                    self._app.after(0, lambda b=new_warn_bits:
-                        self._app._on_engine_warning(b))
-                last_engine_warnings = engine_warnings_raw
+                    # Engine warning alerts — fire on new bits, not every tick
+                    new_warn_bits = engine_warnings_raw & ~last_engine_warnings
+                    if new_warn_bits and is_on_track:
+                        self._app.after(0, lambda b=new_warn_bits:
+                            self._app._on_engine_warning(b))
+                    last_engine_warnings = engine_warnings_raw
 
                 # ── SLOW PATH — every 30 fast ticks (~2 Hz at 60 Hz poll) ──────────
                 # Fuel calcs, opponent parsing, ctx build — don't need every frame.
