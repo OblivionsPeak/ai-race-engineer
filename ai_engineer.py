@@ -1209,6 +1209,7 @@ class App(tk.Tk):
         self._tele_lap_buf: list = []   # frames accumulated for the current lap
         self._tele_best_lap_s: float = 0.0
         self._broadcast_thread: threading.Thread | None = None
+        self._broadcast_session: requests.Session | None = None
         self._last_gap_alert: float = 0.0
         self._last_fuel_diverge_alert: float = 0.0
         self._last_position_alert: float = 0.0
@@ -4696,6 +4697,7 @@ class App(tk.Tk):
     def _start_broadcast(self):
         if not self._server_session_id:
             return
+        self._broadcast_session = requests.Session()  # keep-alive: reuse TCP connection
         self._broadcast_thread = threading.Thread(target=self._broadcast_loop, daemon=True)
         self._broadcast_thread.start()
         self.log(f'Pit wall live at {BACKEND_URL}/engineer/pitwall/{self._server_session_id}')
@@ -4704,7 +4706,7 @@ class App(tk.Tk):
         self._broadcast_thread = None  # daemon — exits with _stop_evt
 
     def _broadcast_loop(self):
-        """Push one telemetry frame to the backend every 50 ms (20 fps)."""
+        """Push one telemetry frame to the backend every 33 ms (30 fps) via keep-alive session."""
         token = self._cfg.get('token', '')
         while not self._stop_evt.is_set() and self._running:
             frame = dict(self._tele_frame)  # snapshot to avoid mutation during POST
@@ -4735,7 +4737,7 @@ class App(tk.Tk):
                         'tire_wear':        _tw_ctx,
                     }
                 try:
-                    requests.post(
+                    self._broadcast_session.post(
                         f'{BACKEND_URL}/engineer/telemetry/push',
                         json={'token': token, 'session_id': sid, 'frame': frame,
                               'meta': meta},
@@ -4746,7 +4748,7 @@ class App(tk.Tk):
                 # Accumulate frame in the current-lap buffer for ref-lap detection
                 if frame.get('p') is not None:
                     self._tele_lap_buf.append(dict(frame))
-            time.sleep(0.05)
+            time.sleep(0.033)
 
     def _push_ref_lap(self, lap_time_s: float):
         """Send the accumulated lap buffer as the reference lap if it's the session best."""
@@ -5058,7 +5060,11 @@ class App(tk.Tk):
                 return
 
             if any(k in _ql for k in ('no tyre change', 'no tire change', 'cancel tyres',
-                                       'cancel tires', 'no tyres', 'no tires')):
+                                       'cancel tires', 'no tyres', 'no tires',
+                                       'keep tyres', 'keep tires', 'keep current tyres',
+                                       'keep current tires', 'leave tyres', 'leave tires',
+                                       'stay on tyres', 'stay on tires', 'no tyre changes',
+                                       'no tire changes', 'uncheck tyres', 'uncheck tires')):
                 self.after(0, lambda: self._pit_command(7))
                 self.speak("Tyre changes cancelled")
                 self.after(0, self._reset_talk_label)
