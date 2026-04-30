@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.35"
+VERSION     = "1.1.36"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -176,6 +176,7 @@ DEFAULTS = {
     'whisper_model':     'base',  # Whisper model size (tiny/base/small/medium)
     'pit_loss_s':        25,      # estimated pit lane time loss in seconds
     'auto_fuel':         True,    # automatically set fuel amount on pit entry
+    'max_stint_mins':    0,       # max stint time in minutes (0 = disabled)
 }
 
 def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
@@ -591,6 +592,7 @@ class TelemetryThread(threading.Thread):
                 lap_completed  = ir['LapCompleted']              or 0
                 session_type   = ir['SessionType']               or ''
                 self._app._current_session_type = session_type   # Feature 5: practice delta
+                fastest_lap_s  = float(ir['FastestLap']          or 0.0)
                 time_remain_s  = ir['SessionTimeRemain']
                 laps_remain    = ir['SessionLapsRemainEx']
                 incidents      = ir['PlayerCarTeamIncidentCount'] or 0
@@ -876,6 +878,7 @@ class TelemetryThread(threading.Thread):
                         'tyre_temps':         tyre_temps,
                         'player_incidents':   player_incidents,
                         'caution':            bool(session_flags & 0x4000),
+                        'fastest_lap_s':      fastest_lap_s,
                         'fuel': {
                             'fuel_remaining_l': round(fuel, 3) if fuel is not None else None,
                             'fuel_burn_per_lap': fuel_delta.get('avg_actual_fpl'),
@@ -1149,6 +1152,15 @@ class App(tk.Tk):
         self._incidents_at_lap_start: int = 0     # F6-new: incident count at lap start
         self._full_qa_log: list = []              # F7-new: full session Q&A log
 
+        # New v1.1.36 feature state
+        self._last_restart_brief: float = 0.0         # F1-new: restart brief cooldown
+        self._last_fastest_lap_push: float = 0.0      # F2-new: fastest lap push cooldown
+        self._pit_window_open_announced: bool = False  # F3-new: pit window open callout gate
+        self._stint_start_time: float = 0.0           # F5-new: wall clock when stint started
+        self._caution_laps: int = 0                    # F6-new: caution lap counter
+        self._caution_lap_announced: int = 0           # F6-new: last announced caution lap
+        self._prev_lap_num_caution: int = 0            # F6-new: lap tracker during caution
+
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
         style.theme_use('clam')
@@ -1217,6 +1229,8 @@ class App(tk.Tk):
         self.v_whisper_model = tk.StringVar(value=self._cfg.get('whisper_model', DEFAULTS['whisper_model']))
         self.v_pit_loss_s  = tk.StringVar(value=str(self._cfg.get('pit_loss_s', DEFAULTS['pit_loss_s'])))
         self.v_auto_fuel   = tk.BooleanVar(value=self._cfg.get('auto_fuel', DEFAULTS['auto_fuel']))
+        self.v_max_stint_mins = tk.StringVar(
+            value=str(self._cfg.get('max_stint_mins', DEFAULTS['max_stint_mins'])))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue(maxsize=5)
@@ -1515,6 +1529,16 @@ class App(tk.Tk):
             command=self._save_auto_fuel_pref,
         ).grid(row=17, column=1, sticky='w', pady=3, columnspan=2)
 
+        # Row 18: Max stint time
+        ttk.Label(frm, text='Max stint (mins)').grid(row=18, column=0, sticky='w', pady=3, padx=(0, 10))
+        max_stint_entry = ttk.Entry(frm, textvariable=self.v_max_stint_mins, width=8)
+        max_stint_entry.grid(row=18, column=1, sticky='w', pady=3)
+        max_stint_entry.bind('<FocusOut>', lambda _: self._save_max_stint_pref())
+        max_stint_entry.bind('<Return>',   lambda _: self._save_max_stint_pref())
+        tk.Label(frm, text='0 = disabled  (endurance driver swap regulation)',
+                 bg=BG2, fg=DIM, font=('Segoe UI', 8)).grid(
+                     row=18, column=2, sticky='w', pady=3, padx=(6, 0))
+
     def _save_fuel_unit_pref(self):
         self._cfg['fuel_unit'] = self.v_fuel_unit.get()
         save_config(self._cfg)
@@ -1602,6 +1626,15 @@ class App(tk.Tk):
     def _save_auto_fuel_pref(self):
         self._cfg['auto_fuel'] = self.v_auto_fuel.get()
         save_config(self._cfg)
+
+    def _save_max_stint_pref(self):
+        try:
+            val = int(float(self.v_max_stint_mins.get()))
+            if val >= 0:
+                self._cfg['max_stint_mins'] = val
+                save_config(self._cfg)
+        except (ValueError, TypeError):
+            pass
 
     def _save_cfg(self):
         """Save main config and also persist per-car subset if a car is loaded."""
@@ -3066,6 +3099,29 @@ class App(tk.Tk):
         except Exception as e:
             self.log(f'[BRIEFING] Error: {e}')
 
+    def _do_restart_brief(self, tele: dict, now: float):
+        """Deliver a brief restart note when caution ends and green flag flies. F1-new v1.1.36."""
+        try:
+            tyre_temps   = tele.get('tyre_temps', {})
+            opponents    = tele.get('opponents', {})
+            my_pos       = opponents.get('my_position')
+            ahead_obj    = opponents.get('ahead')
+            ahead_gap    = ahead_obj.get('gap') if ahead_obj else None
+            parts = []
+            cold = [(c, t) for c, t in tyre_temps.items() if t is not None and t < 80]
+            if cold:
+                coldest = min(cold, key=lambda x: x[1])
+                parts.append(f"Tyres still cold — {coldest[0]} at {coldest[1]:.0f}°C, build heat carefully")
+            if my_pos:
+                gap_str = f"{ahead_gap:.1f}s" if ahead_gap is not None else "close"
+                parts.append(f"You're P{my_pos}, {gap_str} to the car ahead")
+            if parts:
+                self.speak('. '.join(parts))
+            self._last_restart_brief = now
+            self.log('[RESTART] Restart brief fired')
+        except Exception as e:
+            self.log(f'[RESTART] Brief error: {e}')
+
     def _save_session_transcript(self):
         """Write a session transcript file to the AppData directory. Feature 7-new."""
         try:
@@ -3623,6 +3679,13 @@ class App(tk.Tk):
         self._race_briefing_done     = False
         self._incidents_at_lap_start = 0
         self._full_qa_log            = []
+        self._last_restart_brief     = 0.0
+        self._last_fastest_lap_push  = 0.0
+        self._pit_window_open_announced = False
+        self._stint_start_time       = time.time()
+        self._caution_laps           = 0
+        self._caution_lap_announced  = 0
+        self._prev_lap_num_caution   = 0
 
         self._stop_evt.clear()
         self._running = True
@@ -4140,11 +4203,21 @@ class App(tk.Tk):
                 self._did_pit_this_lap = True
                 # Feature 2-new: reset auto fuel flag on pit exit
                 self._auto_fuel_set = False
+                # Feature 4 (v1.1.36): reset stint start time on pit exit
+                self._stint_start_time = time.time()
+                # Feature 4 (v1.1.36): Post-pit fuel confirmation
+                try:
+                    _fuel_confirm = tele.get('fuel_level')
+                    if _fuel_confirm is not None and _fuel_confirm > 5:
+                        self._say('pit_fuel_confirm',
+                                  f"Fuel on board: {_fuel_confirm:.1f} litres", 30)
+                except Exception:
+                    pass
 
             # Feature 1-new: Yellow flag pit strategy assessment
             caution_now = tele.get('caution', False)
+            _is_race = sess_type_now.lower() in self._RACE_SESSION_TYPES
             if caution_now and not self._prev_caution:
-                _is_race = sess_type_now.lower() in self._RACE_SESSION_TYPES
                 if (_is_race and not on_pit_now
                         and now - self._last_yellow_assess > 120):
                     self._last_yellow_assess = now
@@ -4156,6 +4229,45 @@ class App(tk.Tk):
                         args=(_tele_snap_y, _ctx_snap_y),
                         daemon=True,
                     ).start()
+                # Feature 6 (v1.1.36): reset caution lap tracking when caution starts
+                self._caution_laps = 0
+                self._caution_lap_announced = 0
+                self._prev_lap_num_caution = tele.get('lap_num', 0) or 0
+
+            # Feature 6 (v1.1.36): Safety car lap counting during caution
+            if caution_now:
+                _lap_now_c = tele.get('lap_num', 0) or 0
+                if _lap_now_c > self._prev_lap_num_caution and self._prev_lap_num_caution > 0:
+                    self._caution_laps += 1
+                    if self._caution_laps != self._caution_lap_announced and self._caution_laps <= 5:
+                        if self._caution_laps == 1:
+                            self._say('caution_lap_1', "Safety car lap one — hold position", 30)
+                        elif self._caution_laps == 2:
+                            self._say('caution_lap_2', "Safety car lap two — pit lane opens next lap", 30)
+                        elif self._caution_laps == 3:
+                            self._say('caution_lap_3', "Safety car lap three — pit lane is open", 30)
+                        elif self._caution_laps >= 4:
+                            self._say(f'caution_lap_{self._caution_laps}',
+                                      f"Safety car lap {self._caution_laps}", 30)
+                        self._caution_lap_announced = self._caution_laps
+                if _lap_now_c > 0:
+                    self._prev_lap_num_caution = _lap_now_c
+
+            # Feature 1 (v1.1.36): Restart brief — caution just ended (green flag restart)
+            if self._prev_caution and not caution_now:
+                # Reset caution lap tracking on caution end
+                self._caution_laps = 0
+                self._caution_lap_announced = 0
+                self._prev_lap_num_caution = 0
+                if (_is_race and now - self._last_restart_brief > 60
+                        and not coaching_suppressed):
+                    _tele_snap_r = dict(tele)
+                    threading.Thread(
+                        target=self._do_restart_brief,
+                        args=(_tele_snap_r, now),
+                        daemon=True,
+                    ).start()
+
             self._prev_caution = caution_now
 
             # Feature 2-new: Auto fuel on pit entry
@@ -4216,6 +4328,59 @@ class App(tk.Tk):
                                 f"{_worst_v:.0f}°C, back off")
                     if self._say('tyre_overheat', _msg_hot, 60):
                         self.log(f'[TYRE TEMP] {_msg_hot}')
+
+            # Feature 2 (v1.1.36): Fastest lap push
+            if (_is_race and not is_quali_session and not coaching_suppressed):
+                _fastest_lap_s = tele.get('fastest_lap_s', 0.0) or 0.0
+                if (_fastest_lap_s > 0 and self._session_best_lap > 0
+                        and 0 < self._session_best_lap - _fastest_lap_s < 1.0
+                        and now - self._last_fastest_lap_push > 300
+                        and not self._coaching_in_flight):
+                    _fuel_burn_flp = tele.get('fuel_delta', {}).get('avg_actual_fpl') or 0
+                    _fuel_rem_flp  = tele.get('fuel_level') or 0
+                    _fuel_laps_flp = (_fuel_rem_flp / _fuel_burn_flp
+                                      if _fuel_burn_flp > 0 else 999)
+                    if _fuel_laps_flp > 5:
+                        _delta_flp = self._session_best_lap - _fastest_lap_s
+                        self._say(
+                            'fastest_lap_push',
+                            f"You're {_delta_flp:.2f}s off the fastest lap — you have the pace "
+                            f"for it, consider a push lap",
+                            300,
+                        )
+                        self._last_fastest_lap_push = now
+
+            # Feature 3 (v1.1.36): Pit window open explicit callout
+            if _is_race and not is_quali_session:
+                _laps_until_pit_pw = live.get('laps_until_pit')
+                _pit_status_pw     = live.get('pit_window_status', '')
+                if (_laps_until_pit_pw is not None and _laps_until_pit_pw <= 0
+                        and _pit_status_pw in ('open', 'green')):
+                    if not self._pit_window_open_announced and not tele.get('on_pit_road'):
+                        self._say('pit_window_open', "Pit window is open — box when ready", 0)
+                        self._pit_window_open_announced = True
+                elif _laps_until_pit_pw is not None and _laps_until_pit_pw > 2:
+                    self._pit_window_open_announced = False  # reset for next stint
+
+            # Feature 5 (v1.1.36): Stint time tracking
+            _max_stint_mins = self._cfg.get('max_stint_mins', 0)
+            if _max_stint_mins > 0 and self._stint_start_time > 0 and _is_race:
+                _elapsed_mins   = (now - self._stint_start_time) / 60
+                _remaining_mins = _max_stint_mins - _elapsed_mins
+                if 0 < _remaining_mins <= 5:
+                    self._say(
+                        'stint_time_critical',
+                        f"Stint time critical — {_remaining_mins:.0f} minutes remaining, "
+                        f"prepare for driver swap",
+                        120,
+                    )
+                elif 0 < _remaining_mins <= _max_stint_mins * 0.2:
+                    self._say(
+                        'stint_time_warning',
+                        f"Stint time warning — {_remaining_mins:.0f} minutes of your allowed "
+                        f"stint time remaining",
+                        300,
+                    )
 
             self._prev_on_pit_road = on_pit_now
 
