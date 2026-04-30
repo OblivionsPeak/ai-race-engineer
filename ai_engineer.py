@@ -1192,6 +1192,8 @@ class App(tk.Tk):
         self._last_weather_declared_wet: bool = False
         self._last_track_wetness: int = 0
         self._last_track_temp_alerted_c: float | None = None
+        self._track_temp_history: list = []        # [(wall_time, temp_c), ...] rolling 10-min window
+        self._last_track_temp_trend_alert: float = 0.0
         self._gap_history: dict = {'ahead': [], 'behind': []}
         self._last_blue_flag_alert: float = 0.0
         self._prev_blue_flag: bool = False
@@ -3801,6 +3803,8 @@ class App(tk.Tk):
         self._last_weather_declared_wet  = False
         self._last_track_wetness         = 0
         self._last_track_temp_alerted_c  = None
+        self._track_temp_history         = []
+        self._last_track_temp_trend_alert = 0.0
         self._gap_history                = {'ahead': [], 'behind': []}
         self._last_blue_flag_alert       = 0.0
         self._prev_blue_flag             = False
@@ -4191,6 +4195,62 @@ class App(tk.Tk):
                         self.log(f'[WEATHER] {msg}')
                         self._last_track_temp_alerted_c = track_temp_now
                         self._last_weather_alert = now
+
+            # Track temp trend alert — fires when temp has been consistently rising or
+            # falling over a sustained window (Crew Chief style periodic callout).
+            # Separate from the ≥5°C jump alert above; uses linear trend over 3–10 min.
+            if track_temp_now is not None and not is_quali_session and not coaching_suppressed:
+                # Maintain rolling 10-minute history
+                cutoff = now - 600
+                self._track_temp_history = [
+                    (t, v) for t, v in self._track_temp_history if t > cutoff
+                ]
+                self._track_temp_history.append((now, track_temp_now))
+
+                _hist = self._track_temp_history
+                if len(_hist) >= 6:
+                    oldest_t, oldest_v = _hist[0]
+                    span_s = now - oldest_t
+                    if span_s >= 180:  # need at least 3 minutes of data
+                        net_change = track_temp_now - oldest_v
+
+                        # Consistency check: fraction of consecutive pairs that move
+                        # in the same direction as the overall net change
+                        same_dir = sum(
+                            1 for i in range(1, len(_hist))
+                            if (_hist[i][1] - _hist[i-1][1]) * net_change > 0
+                        )
+                        consistency = same_dir / (len(_hist) - 1)
+
+                        _trend_cooldown = 300  # 5 minutes between trend callouts
+                        if (abs(net_change) >= 2.0
+                                and consistency >= 0.60
+                                and now - self._last_track_temp_trend_alert > _trend_cooldown
+                                and now - self._last_weather_alert > 60):
+                            _direction = 'rising' if net_change > 0 else 'falling'
+                            _grip_hint = ("Rubber is going in — grip should be improving."
+                                          if net_change > 0
+                                          else "Grip levels may be dropping off.")
+                            _units = self._cfg.get('units_system', 'metric')
+                            if _units == 'imperial':
+                                _t_disp = f"{_c_to_f(track_temp_now):.0f}°F"
+                                _d_disp = f"{abs(net_change * 9 / 5):.0f}°F"
+                            else:
+                                _t_disp = f"{track_temp_now:.0f}°C"
+                                _d_disp = f"{abs(net_change):.1f}°C"
+                            _span_min = max(1, round(span_s / 60))
+                            _trend_msg = (
+                                f"Track temperature is {_direction} — "
+                                f"up {_d_disp} over the last {_span_min} minutes, "
+                                f"now at {_t_disp}. {_grip_hint}"
+                                if net_change > 0 else
+                                f"Track temperature is {_direction} — "
+                                f"down {_d_disp} over the last {_span_min} minutes, "
+                                f"now at {_t_disp}. {_grip_hint}"
+                            )
+                            if self._say('track_temp_trend', _trend_msg, _trend_cooldown):
+                                self.log(f'[WEATHER] {_trend_msg}')
+                                self._last_track_temp_trend_alert = now
 
             # Blue flag alert
             flags    = ctx.get('session_flags', {})
