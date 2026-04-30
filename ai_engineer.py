@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.34"
+VERSION     = "1.1.35"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -44,6 +44,7 @@ _ensure('edge-tts', 'edge_tts')
 # ── Now safe to import ───────────────────────────────────────────────────────
 
 import asyncio
+from datetime import datetime
 import queue
 import re
 import requests
@@ -173,6 +174,8 @@ DEFAULTS = {
     'wake_word':         'hey engineer',
     'stint_callout_laps': 5,      # speak stint lap count every N laps (0 = off)
     'whisper_model':     'base',  # Whisper model size (tiny/base/small/medium)
+    'pit_loss_s':        25,      # estimated pit lane time loss in seconds
+    'auto_fuel':         True,    # automatically set fuel amount on pit entry
 }
 
 def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
@@ -618,6 +621,20 @@ class TelemetryThread(threading.Thread):
                 tire_wear = {'LF': _tire_wear('LF'), 'RF': _tire_wear('RF'),
                              'LR': _tire_wear('LR'), 'RR': _tire_wear('RR')}
 
+                # Tyre surface temperatures (Feature 5-new)
+                def _tyre_temp(corner):
+                    try:
+                        vals = [ir[f'{corner}temp{s}'] for s in ('CL', 'CM', 'CR')]
+                        valid = [v for v in vals if v is not None and v > 0]
+                        return round(sum(valid) / len(valid), 1) if valid else None
+                    except Exception:
+                        return None
+                tyre_temps = {'LF': _tyre_temp('LF'), 'RF': _tyre_temp('RF'),
+                              'LR': _tyre_temp('LR'), 'RR': _tyre_temp('RR')}
+
+                # Player individual incident count (Feature 6-new)
+                player_incidents = int(ir['PlayerCarMyIncidentCount'] or 0)
+
                 engine_warnings = {
                     'water_temp':    bool(engine_warnings_raw & 0x01),
                     'fuel_pressure': bool(engine_warnings_raw & 0x02),
@@ -776,10 +793,28 @@ class TelemetryThread(threading.Thread):
                                                  my_car_idx, idx_map, car_idx_on_track)
                         if ahead:
                             opponents['ahead'] = ahead
+                        if my_pos > 2:
+                            ahead2 = _find_car_at_pos(my_pos - 2, car_idx_positions, car_idx_f2time,
+                                                      my_car_idx, idx_map, car_idx_on_track)
+                            if ahead2:
+                                opponents['ahead_2'] = ahead2
+                        if my_pos > 3:
+                            ahead3 = _find_car_at_pos(my_pos - 3, car_idx_positions, car_idx_f2time,
+                                                      my_car_idx, idx_map, car_idx_on_track)
+                            if ahead3:
+                                opponents['ahead_3'] = ahead3
                     behind = _find_car_at_pos(my_pos + 1, car_idx_positions, car_idx_f2time,
                                               my_car_idx, idx_map, car_idx_on_track)
                     if behind:
                         opponents['behind'] = behind
+                    behind2 = _find_car_at_pos(my_pos + 2, car_idx_positions, car_idx_f2time,
+                                               my_car_idx, idx_map, car_idx_on_track)
+                    if behind2:
+                        opponents['behind_2'] = behind2
+                    behind3 = _find_car_at_pos(my_pos + 3, car_idx_positions, car_idx_f2time,
+                                               my_car_idx, idx_map, car_idx_on_track)
+                    if behind3:
+                        opponents['behind_3'] = behind3
                     opponents['my_position'] = my_position
                     for _ci, _on_pit in enumerate(car_idx_on_pit):
                         if _ci == my_car_idx:
@@ -801,6 +836,17 @@ class TelemetryThread(threading.Thread):
 
                 live = _calc_live_status(current_lap, stints, plan) if stints else {}
 
+                # Gap to class leader (Feature 8-new)
+                gap_to_leader_s = 0.0
+                try:
+                    if (my_car_idx < len(car_idx_f2time) and player_class_position and
+                            player_class_position != 1):
+                        _leader_f2t = car_idx_f2time[my_car_idx]
+                        if _leader_f2t is not None and _leader_f2t >= 0:
+                            gap_to_leader_s = float(_leader_f2t)
+                except Exception:
+                    pass
+
                 ctx = {
                     'plan': {
                         **plan,
@@ -811,6 +857,7 @@ class TelemetryThread(threading.Thread):
                     'live': live,
                     'telemetry': {
                         'current_lap':        current_lap,
+                        'lap_num':            current_lap,
                         'fuel_level':         round(fuel, 3) if fuel is not None else None,
                         'last_lap_time_s':    round(lap_last, 3) if lap_last > 0 else None,
                         'session_time_s':     round(session_time, 1),
@@ -825,6 +872,10 @@ class TelemetryThread(threading.Thread):
                         'player_car_idx':     my_car_idx,
                         'rival_p1_last_lap':    rival_p1_last_lap,
                         'player_class_position': player_class_position,
+                        'gap_to_leader_s':    gap_to_leader_s,
+                        'tyre_temps':         tyre_temps,
+                        'player_incidents':   player_incidents,
+                        'caution':            bool(session_flags & 0x4000),
                         'fuel': {
                             'fuel_remaining_l': round(fuel, 3) if fuel is not None else None,
                             'fuel_burn_per_lap': fuel_delta.get('avg_actual_fpl'),
@@ -1090,6 +1141,13 @@ class App(tk.Tk):
         self._tyre_wear_by_lap: dict = {}          # Feature 6: per-lap tyre wear tracking
         self._current_session_type: str = ''       # Feature 5: set by slow path for fast path use
         self._personal_best_lap: float = 0.0      # Feature 5: personal best in practice
+        # New v1.1.35 feature state
+        self._prev_caution: bool = False           # F1-new: yellow flag tracking
+        self._last_yellow_assess: float = 0.0     # F1-new: yellow pit assess cooldown
+        self._auto_fuel_set: bool = False          # F2-new: auto fuel set this stint
+        self._race_briefing_done: bool = False     # F3-new: pre-race briefing flag
+        self._incidents_at_lap_start: int = 0     # F6-new: incident count at lap start
+        self._full_qa_log: list = []              # F7-new: full session Q&A log
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -1157,6 +1215,8 @@ class App(tk.Tk):
         _scl_raw = self._cfg.get('stint_callout_laps', DEFAULTS['stint_callout_laps'])
         self.v_stint_callout = tk.StringVar(value='off' if not _scl_raw else str(_scl_raw))
         self.v_whisper_model = tk.StringVar(value=self._cfg.get('whisper_model', DEFAULTS['whisper_model']))
+        self.v_pit_loss_s  = tk.StringVar(value=str(self._cfg.get('pit_loss_s', DEFAULTS['pit_loss_s'])))
+        self.v_auto_fuel   = tk.BooleanVar(value=self._cfg.get('auto_fuel', DEFAULTS['auto_fuel']))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue(maxsize=5)
@@ -1434,6 +1494,27 @@ class App(tk.Tk):
                      row=15, column=2, sticky='w', pady=3, padx=(6, 0))
         whisper_cb.bind('<<ComboboxSelected>>', lambda _: self._save_whisper_model_pref())
 
+        # Row 16: Pit loss (s)
+        ttk.Label(frm, text='Pit loss (s)').grid(row=16, column=0, sticky='w', pady=3, padx=(0, 10))
+        pit_loss_entry = ttk.Entry(frm, textvariable=self.v_pit_loss_s, width=8)
+        pit_loss_entry.grid(row=16, column=1, sticky='w', pady=3)
+        pit_loss_entry.bind('<FocusOut>', lambda _: self._save_pit_loss_pref())
+        pit_loss_entry.bind('<Return>',   lambda _: self._save_pit_loss_pref())
+        tk.Label(frm, text='seconds (used for yellow flag pit assessment)',
+                 bg=BG2, fg=DIM, font=('Segoe UI', 8)).grid(
+                     row=16, column=2, sticky='w', pady=3, padx=(6, 0))
+
+        # Row 17: Auto-set pit fuel
+        ttk.Label(frm, text='Auto pit fuel').grid(row=17, column=0, sticky='w', pady=3, padx=(0, 10))
+        tk.Checkbutton(
+            frm, text='Auto-set pit fuel on pit entry',
+            variable=self.v_auto_fuel,
+            bg=BG2, fg=TEXT, selectcolor=BG3,
+            activebackground=BG2, activeforeground=TEXT,
+            font=('Segoe UI', 9),
+            command=self._save_auto_fuel_pref,
+        ).grid(row=17, column=1, sticky='w', pady=3, columnspan=2)
+
     def _save_fuel_unit_pref(self):
         self._cfg['fuel_unit'] = self.v_fuel_unit.get()
         save_config(self._cfg)
@@ -1507,6 +1588,19 @@ class App(tk.Tk):
 
     def _save_whisper_model_pref(self):
         self._cfg['whisper_model'] = self.v_whisper_model.get()
+        save_config(self._cfg)
+
+    def _save_pit_loss_pref(self):
+        try:
+            val = int(float(self.v_pit_loss_s.get()))
+            if 0 < val < 300:
+                self._cfg['pit_loss_s'] = val
+                save_config(self._cfg)
+        except (ValueError, TypeError):
+            pass
+
+    def _save_auto_fuel_pref(self):
+        self._cfg['auto_fuel'] = self.v_auto_fuel.get()
         save_config(self._cfg)
 
     def _save_cfg(self):
@@ -2690,15 +2784,19 @@ class App(tk.Tk):
             return
         def _do():
             try:
+                _gap_leader = 0.0
+                if self._ctx:
+                    _gap_leader = self._ctx.get('telemetry', {}).get('gap_to_leader_s', 0.0) or 0.0
                 requests.post(
                     f'{BACKEND_URL}/engineer/session/lap',
                     json={
-                        'token':       token,
-                        'session_id':  self._server_session_id,
-                        'lap_num':     lap_num,
-                        'lap_time_s':  lap_time_s,
-                        'fuel_used_l': fuel_used_l,
-                        'position':    position,
+                        'token':           token,
+                        'session_id':      self._server_session_id,
+                        'lap_num':         lap_num,
+                        'lap_time_s':      lap_time_s,
+                        'fuel_used_l':     fuel_used_l,
+                        'position':        position,
+                        'gap_to_leader_s': _gap_leader,
                     },
                     timeout=6,
                 )
@@ -2708,15 +2806,17 @@ class App(tk.Tk):
             try:
                 _rival = self._ctx.get('telemetry', {}).get('rival_p1_last_lap', 0.0) if self._ctx else 0.0
                 _pos   = position or 0
+                _gap_l = self._ctx.get('telemetry', {}).get('gap_to_leader_s', 0.0) if self._ctx else 0.0
                 if _rival and _rival > 0 and _pos > 1 and self._server_session_id:
                     requests.post(
                         f'{BACKEND_URL}/engineer/session/leader_lap',
                         json={
-                            'token':      token,
-                            'session_id': self._server_session_id,
-                            'lap_num':    lap_num,
-                            'lap_time_s': _rival,
-                            'car_name':   'Leader',
+                            'token':           token,
+                            'session_id':      self._server_session_id,
+                            'lap_num':         lap_num,
+                            'lap_time_s':      _rival,
+                            'car_name':        'Leader',
+                            'gap_to_leader_s': _gap_l,
                         },
                         timeout=6,
                     )
@@ -2867,6 +2967,8 @@ class App(tk.Tk):
             f"technique recommendation. Do not repeat the lap time.{setup_hint_str}"
         )
         self.log('[DEBRIEF] Generating session debrief…')
+        # Save transcript before the async debrief fires
+        threading.Thread(target=self._save_session_transcript, daemon=True).start()
 
         def _do():
             try:
@@ -2885,6 +2987,129 @@ class App(tk.Tk):
                 self.log(f'[DEBRIEF] Error: {e}')
 
         threading.Thread(target=_do, daemon=True).start()
+
+    def _yellow_flag_pit_assessment(self, tele: dict, ctx: dict):
+        """Ask the AI whether to box under yellow flag. Feature 1-new."""
+        try:
+            token = self._cfg.get('token', '')
+            if not token:
+                return
+            live       = ctx.get('live', {})
+            opp_data   = tele.get('opponents', {})
+            pos        = opp_data.get('my_position') or '?'
+            behind_obj = opp_data.get('behind')
+            behind_gap = f"{behind_obj['gap']:.1f}" if behind_obj else '?'
+            fuel_info  = tele.get('fuel', {})
+            fuel_rem   = fuel_info.get('fuel_remaining_l')
+            fuel_str   = f"{fuel_rem:.1f}L" if fuel_rem is not None else '?'
+            laps_until_pit = live.get('laps_until_pit', '?')
+            pit_loss   = self._cfg.get('pit_loss_s', 25)
+            question   = (
+                f"Yellow flag just came out. We are P{pos}. Gap to the car behind is {behind_gap}s. "
+                f"Estimated pit loss is {pit_loss}s. We have {fuel_str} fuel, "
+                f"{laps_until_pit} laps until planned pit window. "
+                f"Should we box this lap to gain track position, or stay out? "
+                f"Give a clear recommendation in 2 sentences."
+            )
+            system_prompt = self._build_system_prompt(ctx)
+            r = requests.post(
+                f'{BACKEND_URL}/engineer/coaching',
+                json={'token': token, 'system_prompt': system_prompt, 'question': question},
+                timeout=12,
+            )
+            if r.ok:
+                answer = r.json().get('answer', '')
+                if answer:
+                    self.log(f'[YELLOW] {answer}')
+                    self.after(0, lambda: self._append_qa('[Yellow Flag] Box or stay out?', answer))
+                    self.speak(answer)
+        except Exception as e:
+            self.log(f'[YELLOW] Assessment error: {e}')
+
+    def _do_race_briefing(self, tele: dict, ctx: dict):
+        """Deliver a pre-race briefing at session start. Feature 3-new."""
+        try:
+            token = self._cfg.get('token', '')
+            if not token:
+                return
+            plan    = ctx.get('plan', {})
+            track   = plan.get('track', 'unknown track')
+            total_stints = plan.get('total_stints', '?')
+            race_laps = plan.get('race_laps') or plan.get('race_duration_hrs', '?')
+            weather = ctx.get('weather', {})
+            w_parts = []
+            if weather.get('track_temp_c') is not None:
+                w_parts.append(f"track {weather['track_temp_c']:.0f}°C")
+            if weather.get('air_temp_c') is not None:
+                w_parts.append(f"air {weather['air_temp_c']:.0f}°C")
+            if weather.get('wet'):
+                w_parts.append('WET conditions')
+            weather_str = ', '.join(w_parts) if w_parts else 'conditions nominal'
+            question = (
+                f"Race briefing: {track}, {race_laps} laps/mins, {total_stints} planned stops. "
+                f"Current conditions: {weather_str}. "
+                f"Give a 3-sentence pre-race briefing covering: race distance, pit strategy summary, "
+                f"and one key thing to watch. Be concise and energetic."
+            )
+            system_prompt = self._build_system_prompt(ctx)
+            r = requests.post(
+                f'{BACKEND_URL}/engineer/coaching',
+                json={'token': token, 'system_prompt': system_prompt, 'question': question},
+                timeout=15,
+            )
+            if r.ok:
+                answer = r.json().get('answer', '')
+                if answer:
+                    self.log(f'[BRIEFING] {answer}')
+                    self.after(0, lambda: self._append_qa('[Pre-Race Briefing]', answer))
+                    self.speak(answer)
+        except Exception as e:
+            self.log(f'[BRIEFING] Error: {e}')
+
+    def _save_session_transcript(self):
+        """Write a session transcript file to the AppData directory. Feature 7-new."""
+        try:
+            with self._ctx_lock:
+                ctx = self._ctx
+            plan       = (ctx or {}).get('plan', {})
+            track      = plan.get('track', 'unknown')
+            sess_type  = (ctx or {}).get('session', {}).get('type', 'session')
+            total_laps = self._total_laps_this_session
+            now_str    = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename   = f'session_{now_str}.txt'
+            path       = os.path.join(APPDATA_DIR, filename)
+
+            lines = [
+                f'=== SESSION TRANSCRIPT ===',
+                f'Date/Time : {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+                f'Track     : {track}',
+                f'Session   : {sess_type}',
+                f'Total Laps: {total_laps}',
+                f'Best Lap  : {self._session_best_lap:.3f}s' if self._session_best_lap > 0 else 'Best Lap  : N/A',
+                '',
+                '--- LAP TIMES ---',
+            ]
+            for i, t in enumerate(self._lap_times_this_session):
+                marker = ' *PB*' if (t == self._session_best_lap and i > 0) else ''
+                lines.append(f'  Lap {i+1:3d}: {int(t)//60}:{t % 60:06.3f}{marker}')
+
+            if self._session_notes:
+                lines += ['', '--- SESSION NOTES ---']
+                for note in self._session_notes:
+                    lines.append(f'  {note}')
+
+            if self._full_qa_log:
+                lines += ['', '--- Q&A LOG ---']
+                for q, a in self._full_qa_log:
+                    lines.append(f'Q: {q}')
+                    lines.append(f'A: {a}')
+                    lines.append('')
+
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            self.log(f'[TRANSCRIPT] Saved to {path}')
+        except Exception as e:
+            self.log(f'[TRANSCRIPT] Save error: {e}')
 
     def _on_opponent_pit_exit(self, opp_name: str, opp_position: int, pit_entry_lap: int):
         """Fired when a nearby opponent exits the pits. Alerts and triggers strategy coaching."""
@@ -3296,8 +3521,8 @@ class App(tk.Tk):
 
     def _add_session_note(self, note: str):
         self._session_notes.append(note)
-        if len(self._session_notes) > 20:
-            self._session_notes = self._session_notes[-20:]
+        if len(self._session_notes) > 50:
+            self._session_notes = self._session_notes[-50:]
 
     # ── Engineer control ─────────────────────────────────────────────────────
 
@@ -3392,6 +3617,12 @@ class App(tk.Tk):
         self._tyre_wear_by_lap       = {}
         self._current_session_type   = ''
         self._personal_best_lap      = 0.0
+        self._prev_caution           = False
+        self._last_yellow_assess     = 0.0
+        self._auto_fuel_set          = False
+        self._race_briefing_done     = False
+        self._incidents_at_lap_start = 0
+        self._full_qa_log            = []
 
         self._stop_evt.clear()
         self._running = True
@@ -3907,6 +4138,85 @@ class App(tk.Tk):
                 # Feature 4 — reset stint lap counter on pit exit
                 self._stint_lap = 0
                 self._did_pit_this_lap = True
+                # Feature 2-new: reset auto fuel flag on pit exit
+                self._auto_fuel_set = False
+
+            # Feature 1-new: Yellow flag pit strategy assessment
+            caution_now = tele.get('caution', False)
+            if caution_now and not self._prev_caution:
+                _is_race = sess_type_now.lower() in self._RACE_SESSION_TYPES
+                if (_is_race and not on_pit_now
+                        and now - self._last_yellow_assess > 120):
+                    self._last_yellow_assess = now
+                    self.log('[YELLOW] Pit strategy assessment triggered')
+                    _tele_snap_y = dict(tele)
+                    _ctx_snap_y  = dict(ctx)
+                    threading.Thread(
+                        target=self._yellow_flag_pit_assessment,
+                        args=(_tele_snap_y, _ctx_snap_y),
+                        daemon=True,
+                    ).start()
+            self._prev_caution = caution_now
+
+            # Feature 2-new: Auto fuel on pit entry
+            if (not self._prev_on_pit_road and on_pit_now
+                    and self._cfg.get('auto_fuel', True)
+                    and not self._auto_fuel_set
+                    and sess_type_now.lower() in self._RACE_SESSION_TYPES):
+                try:
+                    _live_af   = ctx.get('live', {})
+                    _tele_af   = tele
+                    _laps_pit  = _live_af.get('laps_until_pit') or 0
+                    _fuel_burn = _tele_af.get('fuel', {}).get('fuel_burn_per_lap') or \
+                                 _tele_af.get('fuel_delta', {}).get('avg_actual_fpl')
+                    _fuel_rem  = _tele_af.get('fuel', {}).get('fuel_remaining_l') or \
+                                 _tele_af.get('fuel_level')
+                    if _fuel_burn and _fuel_rem is not None and _laps_pit > 0:
+                        _fuel_to_add = max(0, _laps_pit * _fuel_burn - _fuel_rem + 1.0)
+                        _fuel_litres = int(math.ceil(_fuel_to_add))
+                        if 0 < _fuel_litres < 120:
+                            self._auto_fuel_set = True
+                            self.after(1000, lambda l=_fuel_litres: self._pit_command(2, l))
+                            _af_msg = f"Auto fuel set — adding {_fuel_litres} litres"
+                            self.speak(_af_msg)
+                            self.log(f'[AUTO FUEL] Set {_fuel_litres}L in pit box')
+                except Exception as _afe:
+                    self.log(f'[AUTO FUEL] Error: {_afe}')
+
+            # Feature 3-new: Pre-race briefing at session start
+            _lap_num_now = tele.get('lap_num', tele.get('current_lap', 0)) or 0
+            if (not self._race_briefing_done
+                    and sess_type_now.lower() in self._RACE_SESSION_TYPES
+                    and _lap_num_now is not None and _lap_num_now <= 1):
+                self._race_briefing_done = True
+                _tele_br = dict(tele)
+                _ctx_br  = dict(ctx)
+                threading.Thread(
+                    target=self._do_race_briefing,
+                    args=(_tele_br, _ctx_br),
+                    daemon=True,
+                ).start()
+
+            # Feature 5-new: Tyre surface temperature alerts
+            _tyre_temps_now = tele.get('tyre_temps', {})
+            if _tyre_temps_now and not coaching_suppressed:
+                # Cold tyres on out-lap
+                if self._stint_lap == 1:
+                    _cold_corners = [c for c, v in _tyre_temps_now.items()
+                                     if v is not None and v < 60]
+                    if _cold_corners:
+                        if self._say('tyre_cold', "Tyres are cold — build heat before pushing", 120):
+                            self.log('[TYRE TEMP] Cold tyre alert fired')
+                # Overheating tyres
+                _hot_corners = [(c, v) for c, v in _tyre_temps_now.items()
+                                if v is not None and v > 115]
+                if _hot_corners:
+                    _worst_c, _worst_v = max(_hot_corners, key=lambda x: x[1])
+                    _msg_hot = (f"Tyre temp warning — {_worst_c} overheating at "
+                                f"{_worst_v:.0f}°C, back off")
+                    if self._say('tyre_overheat', _msg_hot, 60):
+                        self.log(f'[TYRE TEMP] {_msg_hot}')
+
             self._prev_on_pit_road = on_pit_now
 
     # ── Keyboard listener (push-to-talk) ─────────────────────────────────────
@@ -4757,13 +5067,28 @@ class App(tk.Tk):
                     f"P{ahead['position']} {ahead['name']} +{ahead['gap']:.1f}s ahead"
                     + _gap_trend('ahead')
                 )
+            ahead_2 = opponents.get('ahead_2')
+            if ahead_2:
+                opp_parts.append(f"P{ahead_2['position']} {ahead_2['name']} +{ahead_2['gap']:.1f}s ahead")
+            ahead_3 = opponents.get('ahead_3')
+            if ahead_3:
+                opp_parts.append(f"P{ahead_3['position']} {ahead_3['name']} +{ahead_3['gap']:.1f}s ahead")
             if behind:
                 opp_parts.append(
                     f"P{behind['position']} {behind['name']} +{behind['gap']:.1f}s behind"
                     + _gap_trend('behind')
                 )
+            behind_2 = opponents.get('behind_2')
+            if behind_2:
+                opp_parts.append(f"P{behind_2['position']} {behind_2['name']} +{behind_2['gap']:.1f}s behind")
+            behind_3 = opponents.get('behind_3')
+            if behind_3:
+                opp_parts.append(f"P{behind_3['position']} {behind_3['name']} +{behind_3['gap']:.1f}s behind")
             if opp_parts:
                 lines.append(f"OPPONENTS: {' | '.join(opp_parts)}")
+            gap_leader = tele.get('gap_to_leader_s')
+            if gap_leader and gap_leader > 0:
+                lines.append(f"GAP TO CLASS LEADER: {gap_leader:.1f}s")
 
         if self._pit_stop_log:
             last_ps     = self._pit_stop_log[-1]
@@ -4896,6 +5221,11 @@ class App(tk.Tk):
         pos = tele_snap.get('opponents', {}).get('my_position')
         self._record_server_lap(lap_num, lap_time, fpl, pos)
 
+        # Feature 6-new: incidents per lap tracking
+        incidents_now = tele_snap.get('player_incidents', 0)
+        incidents_this_lap = max(0, incidents_now - self._incidents_at_lap_start)
+        self._incidents_at_lap_start = incidents_now
+
         is_quali = st in self._QUALI_SESSION_TYPES
 
         # Feature 4 — Stint lap counter (skip callout in qualifying)
@@ -4989,7 +5319,8 @@ class App(tk.Tk):
                   rival_p1_time,
                   self._driving_mode,
                   dict(self._tyre_wear_by_lap),
-                  self._personal_best_lap),
+                  self._personal_best_lap,
+                  incidents_this_lap),
             daemon=True,
         ).start()
 
@@ -4999,7 +5330,8 @@ class App(tk.Tk):
                           rival_p1_last_lap: float = 0.0,
                           driving_mode: str = 'normal',
                           tyre_wear_by_lap: dict | None = None,
-                          personal_best_lap: float = 0.0):
+                          personal_best_lap: float = 0.0,
+                          incidents_this_lap: int = 0):
         recent   = self._lap_times_this_session[-5:]
         avg      = sum(recent) / len(recent) if recent else lap_time
         imperial = (self._cfg.get('units_system', 'metric') == 'imperial')
@@ -5062,6 +5394,10 @@ class App(tk.Tk):
                     f"not driver error."
                 )
 
+        # Feature 6-new: incidents this lap
+        if incidents_this_lap > 0:
+            deg_str += f" {incidents_this_lap}x incident(s) this lap."
+
         # Feature 6 — Tyre wear coaching addition
         if tyre_wear_by_lap and lap_num in tyre_wear_by_lap:
             _tw_now = tyre_wear_by_lap[lap_num]
@@ -5090,6 +5426,21 @@ class App(tk.Tk):
                         )
                     else:
                         deg_str += f" Tyre wear: {_avg_tread*100:.0f}% avg remaining."
+
+        # Feature 5-new: tyre surface temperature coaching note
+        with self._ctx_lock:
+            _ctx_tt = self._ctx
+        _tyre_temps_snap = (_ctx_tt or {}).get('telemetry', {}).get('tyre_temps', {}) if _ctx_tt else {}
+        if _tyre_temps_snap:
+            _tt_vals = [(c, v) for c, v in _tyre_temps_snap.items() if v is not None]
+            if _tt_vals:
+                _hot = [(c, v) for c, v in _tt_vals if v > 110]
+                _cold = [(c, v) for c, v in _tt_vals if v < 70]
+                if _hot:
+                    _worst_c, _worst_v = max(_hot, key=lambda x: x[1])
+                    deg_str += f" Tyre temp warning: {_worst_c} at {_worst_v:.0f}°C (overheating)."
+                if _cold:
+                    deg_str += f" Tyre temps still cold on {', '.join(c for c, _ in _cold)} — build heat."
 
         # Handling tendencies string — suppress brake bias recs for 8 laps after one is given
         HANDLING_COOLDOWN = 8
@@ -5222,6 +5573,7 @@ class App(tk.Tk):
     # ── Q&A display ───────────────────────────────────────────────────────────
 
     def _append_qa(self, question: str, answer: str):
+        self._full_qa_log.append((question, answer))
         self.qa_box.config(state='normal')
         self.qa_box.insert('end', f'Q: {question}\nA: {answer}\n\n')
         self.qa_box.see('end')
