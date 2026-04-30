@@ -27,6 +27,26 @@ jobs:
           pip install pyinstaller
           pip install -r requirements_engineer.txt
 
+      - name: Inject version from tag
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'.TrimStart('v')
+          $parts = $tag.Split('.')
+          $major = [int]$parts[0]; $minor = [int]$parts[1]; $patch = [int]$parts[2]
+
+          # Patch VERSION constant in ai_engineer.py
+          $src = Get-Content ai_engineer.py -Raw
+          $src = $src -replace 'VERSION\s*=\s*"[^"]+"', "VERSION     = `"$tag`""
+          Set-Content ai_engineer.py $src -NoNewline
+
+          # Patch engineer_version.txt (Windows EXE metadata)
+          $ver = Get-Content engineer_version.txt -Raw
+          $ver = $ver -replace 'filevers=\(\d+, \d+, \d+, \d+\)', "filevers=($major, $minor, $patch, 0)"
+          $ver = $ver -replace 'prodvers=\(\d+, \d+, \d+, \d+\)', "prodvers=($major, $minor, $patch, 0)"
+          $ver = $ver -replace "FileVersion', u'[\d.]+'",   "FileVersion', u'$tag.0'"
+          $ver = $ver -replace "ProductVersion', u'[\d.]+'", "ProductVersion', u'$tag.0'"
+          Set-Content engineer_version.txt $ver -NoNewline
+
       - name: Build EXE
         run: python -m PyInstaller engineer.spec --noconfirm
 
