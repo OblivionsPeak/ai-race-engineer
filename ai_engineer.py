@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.30"
+VERSION     = "1.1.31"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -641,10 +641,18 @@ class TelemetryThread(threading.Thread):
                             _dyn = {
                                 'avg_throttle': round(sum(d[0] for d in dynamics_buffer) / _n, 2),
                                 'avg_brake':    round(sum(d[1] for d in dynamics_buffer) / _n, 2),
-                                'oversteer':    sum(1 for d in dynamics_buffer
-                                                    if abs(d[3]) > 0.5 and d[0] < 0.3),
-                                'understeer':   sum(1 for d in dynamics_buffer
-                                                    if d[0] > 0.7 and abs(d[2]) < 3.0 and d[4] > 20),
+                                # Oversteer: rotating fast (yaw > 0.4 rad/s) with low throttle at speed
+                                # Captures lift-off / brake oversteer; excludes power oversteer & low-speed hairpins
+                                'oversteer':    round(sum(1 for d in dynamics_buffer
+                                                    if abs(d[3]) > 0.4
+                                                    and d[0] < 0.3
+                                                    and d[4] > 10) / _n * 100, 1),
+                                # Understeer: car has lateral load (in a corner) but is not rotating
+                                # abs(lat_accel) > 1.0 m/s² = actually cornering; yaw < 0.15 rad/s = plowing
+                                'understeer':   round(sum(1 for d in dynamics_buffer
+                                                    if abs(d[2]) > 1.0
+                                                    and abs(d[3]) < 0.15
+                                                    and d[4] > 15) / _n * 100, 1),
                             }
                         dynamics_buffer.clear()
                         # 2 slow ticks (~1 s) lets LapLastLapTime settle before coaching fires
@@ -2561,21 +2569,23 @@ class App(tk.Tk):
                     f" Weakest sector overall: {worst.upper()}."
                 )
 
-        # Handling summary across all laps
+        # Handling summary across all laps (values are now % of lap, not raw frame counts)
         handling_summary_str = ''
         if self._per_lap_dynamics:
-            total_over  = sum(d.get('oversteer', 0)  for d in self._per_lap_dynamics.values())
-            total_under = sum(d.get('understeer', 0) for d in self._per_lap_dynamics.values())
-            n_laps_dyn  = len(self._per_lap_dynamics)
-            if total_over > total_under * 1.5 and total_over / n_laps_dyn > 3:
+            vals_over  = [d.get('oversteer',  0) for d in self._per_lap_dynamics.values()]
+            vals_under = [d.get('understeer', 0) for d in self._per_lap_dynamics.values()]
+            n_laps_dyn = len(self._per_lap_dynamics)
+            avg_over   = sum(vals_over)  / n_laps_dyn
+            avg_under  = sum(vals_under) / n_laps_dyn
+            if avg_over > avg_under * 1.5 and avg_over > 3:
                 handling_summary_str = (
                     f" Handling: consistent oversteer tendency across the session "
-                    f"({total_over} events over {n_laps_dyn} laps) — consider setup or brake bias adjustment."
+                    f"({avg_over:.1f}% avg per lap over {n_laps_dyn} laps) — consider setup or brake bias adjustment."
                 )
-            elif total_under > total_over * 1.5 and total_under / n_laps_dyn > 3:
+            elif avg_under > avg_over * 1.5 and avg_under > 3:
                 handling_summary_str = (
                     f" Handling: consistent understeer tendency across the session "
-                    f"({total_under} events over {n_laps_dyn} laps) — consider setup or brake bias adjustment."
+                    f"({avg_under:.1f}% avg per lap over {n_laps_dyn} laps) — consider setup or brake bias adjustment."
                 )
 
         # Consistency across the session
@@ -4538,15 +4548,15 @@ class App(tk.Tk):
                 and self._last_handling_coached_lap > 0
             )
             if not handling_within_cooldown:
-                if lap_dynamics.get('oversteer', 0) > 5:
+                if lap_dynamics.get('oversteer', 0) > 3:
                     h_parts.append(
-                        f"oversteer events: {lap_dynamics['oversteer']} "
+                        f"oversteer: {lap_dynamics['oversteer']}% of lap "
                         f"(rear stepping out under braking — suggest moving brake bias forward, "
                         f"e.g. 'add 1 click of front brake bias')"
                     )
-                if lap_dynamics.get('understeer', 0) > 5:
+                if lap_dynamics.get('understeer', 0) > 3:
                     h_parts.append(
-                        f"understeer events: {lap_dynamics['understeer']} "
+                        f"understeer: {lap_dynamics['understeer']}% of lap "
                         f"(front pushing wide — suggest moving brake bias rearward, "
                         f"e.g. 'add 1 click of rear brake bias')"
                     )
