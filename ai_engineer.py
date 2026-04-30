@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.29"
+VERSION     = "1.1.30"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -165,6 +165,7 @@ DEFAULTS = {
     'personality':       DEFAULT_PERSONALITY,
     'units_system':      'metric',
     'checkin_laps':      5,
+    'checkin_mins':      0,
     'tts_rate':          1.0,
     'listen_mode':       'ptt',   # 'ptt', 'vad', or 'wake'
     'vad_sensitivity':   0.02,    # RMS threshold for voice activity detection
@@ -957,6 +958,8 @@ class App(tk.Tk):
         self._last_pit_briefed_stint: int = 0
         self._last_fuel_save_lap: int = 0
         self._last_pit_window_alert_laps: int = 999
+        self._coaching_suppressed_until: float = 0.0
+        self._last_checkin_time: float = 0.0
         self._track_history: dict = {}
         self._prev_session_type: str = ''
         self._session_debrief_triggered: bool = False
@@ -1044,6 +1047,8 @@ class App(tk.Tk):
         self.v_units        = tk.StringVar(value=self._cfg.get('units_system', 'metric'))
         _ci_raw = self._cfg.get('checkin_laps', 5)
         self.v_checkin_laps = tk.StringVar(value='never' if not _ci_raw else str(_ci_raw))
+        _cm_raw = self._cfg.get('checkin_mins', 0)
+        self.v_checkin_mins = tk.StringVar(value='off' if not _cm_raw else str(_cm_raw))
         self.v_tts_rate = tk.DoubleVar(value=self._cfg.get('tts_rate', 1.0))
         self.v_listen_mode = tk.StringVar(value=self._cfg.get('listen_mode', 'ptt'))
         self.v_vad_sensitivity = tk.DoubleVar(
@@ -1238,14 +1243,20 @@ class App(tk.Tk):
         units_cb.grid(row=9, column=1, sticky='w', pady=3)
         units_cb.bind('<<ComboboxSelected>>', lambda _: self._save_units_pref())
 
-        # Row 10: Coaching check-in frequency
+        # Row 10: Coaching check-in frequency (lap-based)
         ttk.Label(frm, text='Check-in every').grid(row=10, column=0, sticky='w', pady=3, padx=(0, 10))
         checkin_cb = ttk.Combobox(frm, textvariable=self.v_checkin_laps,
                                   values=['3', '5', '10', 'never'],
                                   state='readonly', width=12)
         checkin_cb.grid(row=10, column=1, sticky='w', pady=3)
-        ttk.Label(frm, text='laps').grid(row=10, column=2, sticky='w', pady=3)
+        ttk.Label(frm, text='laps  or').grid(row=10, column=2, sticky='w', pady=3)
         checkin_cb.bind('<<ComboboxSelected>>', lambda _: self._save_checkin_pref())
+        checkin_mins_cb = ttk.Combobox(frm, textvariable=self.v_checkin_mins,
+                                       values=['5', '10', '15', '20', '30', 'off'],
+                                       state='readonly', width=8)
+        checkin_mins_cb.grid(row=10, column=3, sticky='w', pady=3, padx=(4, 0))
+        ttk.Label(frm, text='min').grid(row=10, column=4, sticky='w', pady=3)
+        checkin_mins_cb.bind('<<ComboboxSelected>>', lambda _: self._save_checkin_mins_pref())
 
         # Row 11: Voice Speed
         ttk.Label(frm, text='Voice Speed').grid(row=11, column=0, sticky='w', pady=3, padx=(0, 10))
@@ -1333,6 +1344,11 @@ class App(tk.Tk):
     def _save_checkin_pref(self):
         val = self.v_checkin_laps.get()
         self._cfg['checkin_laps'] = 0 if val == 'never' else int(val)
+        save_config(self._cfg)
+
+    def _save_checkin_mins_pref(self):
+        val = self.v_checkin_mins.get()
+        self._cfg['checkin_mins'] = 0 if val == 'off' else int(val)
         save_config(self._cfg)
 
     def _save_rate_pref(self):
@@ -1464,6 +1480,32 @@ class App(tk.Tk):
                     break
         self.mute_btn.config(text='Unmute' if self._muted else 'Mute')
         self.log('[MUTE] Voice muted.' if self._muted else '[MUTE] Voice unmuted.')
+
+    SNOOZE_SECONDS = 300  # 5-minute advisory snooze
+
+    def _acknowledge(self):
+        """Drain TTS queue and snooze all advisory coaching for SNOOZE_SECONDS."""
+        while not self._tts_queue.empty():
+            try:
+                self._tts_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._coaching_suppressed_until = time.time() + self.SNOOZE_SECONDS
+        self.speak("Copy that")
+        self.log(f'[ACK] Acknowledged — advisory coaching snoozed {self.SNOOZE_SECONDS // 60} min')
+        self.after(0, self._reset_talk_label)
+        self.after(0, self._update_ack_label)
+
+    def _update_ack_label(self):
+        """Refresh the snooze badge text; reschedules itself every 30s while active."""
+        remaining = self._coaching_suppressed_until - time.time()
+        if remaining > 0:
+            mins = int(remaining // 60) + 1
+            self._ack_label.config(
+                text=f'SNOOZED {mins}m', fg=YELLOW, bg=BG)
+            self.after(30000, self._update_ack_label)
+        else:
+            self._ack_label.config(text='', fg=BG, bg=BG)
 
     def _logout(self):
         self._cfg['token']        = ''
@@ -1648,6 +1690,12 @@ class App(tk.Tk):
         self.mute_btn = ttk.Button(bf, text='Mute', style='Browse.TButton',
                                    command=self._toggle_mute)
         self.mute_btn.pack(side='left', padx=(8, 0))
+        self.ack_btn = ttk.Button(bf, text='✓ Copy', style='Browse.TButton',
+                                  command=self._acknowledge)
+        self.ack_btn.pack(side='left', padx=(8, 0))
+        self._ack_label = tk.Label(bf, text='', bg=BG, fg=BG,
+                                   font=('Segoe UI', 8, 'bold'))
+        self._ack_label.pack(side='left', padx=(4, 0))
         tk.Label(bf, text='iRacing must be running before starting.',
                  bg=BG, fg=DIM, font=('Segoe UI', 8)).pack(side='right')
 
@@ -3030,6 +3078,8 @@ class App(tk.Tk):
         self._last_pit_briefed_stint     = 0
         self._last_fuel_save_lap         = 0
         self._last_pit_window_alert_laps = 999
+        self._coaching_suppressed_until  = 0.0
+        self._last_checkin_time          = 0.0
         self._session_best_lap           = 0.0
         self._lap_times_this_session     = []
         self._session_started            = False
@@ -3252,6 +3302,7 @@ class App(tk.Tk):
             tele      = tele_chk
             now       = time.time()
             warn_laps = self._cfg.get('fuel_warning_laps', DEFAULTS['fuel_warning_laps'])
+            coaching_suppressed = now < self._coaching_suppressed_until
 
             # Prefer live sensor + measured FPL for accuracy; fall back to plan estimate
             fuel_sensor   = tele.get('fuel_level')
@@ -3297,7 +3348,8 @@ class App(tk.Tk):
                 self._speak_pit_briefing(live, tele)
 
             # Fuel save coaching — fires when driver won't make pit window on current burn
-            if (fuel_laps_measured >= 3
+            if (not coaching_suppressed
+                    and fuel_laps_measured >= 3
                     and laps_until_pit is not None and laps_until_pit > 0
                     and laps_of_fuel is not None
                     and avg_fpl and fuel_sensor
@@ -3314,7 +3366,8 @@ class App(tk.Tk):
                     ).start()
 
             # Pit window countdown alerts — 5, 3, 2 laps out (before AI strategy fires at ≤1)
-            if (laps_until_pit is not None and pit_status in ('green', 'yellow')
+            if (not coaching_suppressed
+                    and laps_until_pit is not None and pit_status in ('green', 'yellow')
                     and sess_type_now.lower() in ('race', 'feature race', 'heat race', 'lone qualify')
                     and not tele.get('on_pit_road')):
                 _alert = self._last_pit_window_alert_laps
@@ -3332,7 +3385,8 @@ class App(tk.Tk):
                     self._last_pit_window_alert_laps = 2
 
             # Proactive pit strategy — fires once when window opens (laps_until_pit == 0 or 1)
-            if (pit_status in ('open', 'green')
+            if (not coaching_suppressed
+                    and pit_status in ('open', 'green')
                     and laps_until_pit is not None and laps_until_pit <= 1
                     and sess_type_now.lower() in ('race', 'feature race', 'heat race', 'lone qualify')
                     and current_lap_now > self._last_strategy_lap + 3
@@ -3348,18 +3402,18 @@ class App(tk.Tk):
                     self.log(f'[ALERT] {msg}')
                     self._last_overdue_alert = now
 
-            # Weather / track evolution alerts
+            # Weather / track evolution alerts (advisory — suppressed by ack)
             weather = ctx.get('weather', {})
             wet_now     = weather.get('wet', False)
             wetness_now = weather.get('track_wetness', 0)
-            if wet_now != self._last_weather_declared_wet:
+            if not coaching_suppressed and wet_now != self._last_weather_declared_wet:
                 msg = ("Session declared wet — wet tyres now permitted."
                        if wet_now else "Session changed to dry conditions.")
                 if self._say('weather_declared_wet', msg, 30):
                     self.log(f'[WEATHER] {msg}')
                     self._last_weather_declared_wet = wet_now
                     self._last_weather_alert = now
-            elif wetness_now >= 4 and self._last_track_wetness < 4:
+            elif not coaching_suppressed and wetness_now >= 4 and self._last_track_wetness < 4:
                 msg = "Track conditions are getting wet. Consider your pit strategy."
                 if self._say('weather_wet', msg, 60):
                     self.log(f'[WEATHER] {msg}')
@@ -3373,7 +3427,8 @@ class App(tk.Tk):
             if track_temp_now is not None:
                 if self._last_track_temp_alerted_c is None:
                     self._last_track_temp_alerted_c = track_temp_now
-                elif abs(track_temp_now - self._last_track_temp_alerted_c) >= 5.0 \
+                elif not coaching_suppressed \
+                        and abs(track_temp_now - self._last_track_temp_alerted_c) >= 5.0 \
                         and now - self._last_weather_alert > 120:
                     delta_t = track_temp_now - self._last_track_temp_alerted_c
                     direction = 'risen' if delta_t > 0 else 'dropped'
@@ -3404,7 +3459,7 @@ class App(tk.Tk):
             gap_history = self._gap_history
             ahead_hist  = gap_history.get('ahead', [])
             behind_hist = gap_history.get('behind', [])
-            if now - self._last_gap_alert > 45:
+            if not coaching_suppressed and now - self._last_gap_alert > 45:
                 opp = tele.get('opponents', {})
                 if len(behind_hist) >= 5:
                     behind_delta = behind_hist[-1] - behind_hist[-5]
@@ -3903,8 +3958,15 @@ class App(tk.Tk):
                     self.after(0, self._reset_talk_label)
                     return
             self.log(f'You: "{question}"')
+            # Acknowledgment gate — driver said "copy", "roger", etc.
+            _ql = question.lower().rstrip('. ')
+            _ACK_PHRASES = ('copy', 'roger', 'acknowledged', 'got it',
+                            'affirmative', 'understood', 'noted', 'copy that')
+            if any(_ql == p or _ql.startswith(p + ' ') or _ql.startswith(p + ',')
+                   for p in _ACK_PHRASES):
+                self._acknowledge()
+                return
             # Route pit-strategy and fuel-save questions to focused handlers
-            _ql = question.lower()
             _pit_keywords    = ('pit', 'box', 'stop', 'stay out', 'extend')
             _strategy_intent = ('should', 'when', 'now', 'this lap', 'strategy', 'call')
             _save_keywords   = ('save fuel', 'fuel save', 'saving fuel', 'how much fuel',
@@ -4357,6 +4419,18 @@ class App(tk.Tk):
         _ci = self._cfg.get('checkin_laps', 5)
         is_check_in = bool(_ci) and (lap_num % _ci == 0)
 
+        # Time-based check-in — fires when checkin_mins has elapsed since last check-in
+        _cm = self._cfg.get('checkin_mins', 0)
+        if _cm and not is_check_in:
+            elapsed_since_checkin = time.time() - self._last_checkin_time
+            if elapsed_since_checkin >= _cm * 60:
+                is_check_in = True
+
+        # Respect driver acknowledgment — suppress advisory coaching during snooze
+        if time.time() < self._coaching_suppressed_until:
+            is_check_in = False
+            is_slow     = False
+
         if not (is_pb or is_slow or is_check_in):
             return
 
@@ -4366,6 +4440,7 @@ class App(tk.Tk):
             reason = f'Lap {(lap_time - avg):.1f}s slower than recent average'
         else:
             reason = 'Regular check-in'
+            self._last_checkin_time = time.time()
 
         # Speak the lap time immediately so the driver hears it without network delay
         spoken_time = self._fmt_lap_spoken(lap_time)
