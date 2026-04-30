@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.31"
+VERSION     = "1.1.32"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -170,6 +170,8 @@ DEFAULTS = {
     'listen_mode':       'ptt',   # 'ptt', 'vad', or 'wake'
     'vad_sensitivity':   0.02,    # RMS threshold for voice activity detection
     'wake_word':         'hey engineer',
+    'stint_callout_laps': 5,      # speak stint lap count every N laps (0 = off)
+    'whisper_model':     'base',  # Whisper model size (tiny/base/small/medium)
 }
 
 def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
@@ -409,6 +411,7 @@ class TelemetryThread(threading.Thread):
         fuel_at_lap_end         = None   # fuel level captured at each lap boundary (not every tick)
         fuel_history            = []
         auto_plan_detected      = False
+        car_detected            = False  # Feature 8: fire _on_car_detected once per connection
         last_pit_repair_left    = 0.0    # track changes to fire proactive damage alerts
         last_engine_warnings    = 0      # track new engine warning bits
         last_meatball           = False  # track meatball (serviceable) flag transitions
@@ -447,6 +450,7 @@ class TelemetryThread(threading.Thread):
                 if not ir.is_initialized or not ir.is_connected:
                     self._app.set_status('connecting')
                     auto_plan_detected = False
+                    car_detected = False
                     # Mark existing ctx stale so the AI knows telemetry is unavailable
                     with self._app._ctx_lock:
                         if self._app._ctx:
@@ -609,6 +613,33 @@ class TelemetryThread(threading.Thread):
                 my_car_idx        = ir['PlayerCarIdx']       or 0
                 driver_info       = ir['DriverInfo']         or {}
 
+                # Car detection — emit once per connection (Feature 8)
+                if not car_detected and driver_info:
+                    _drivers_list = driver_info.get('Drivers', []) or []
+                    _player_idx   = driver_info.get('DriverCarIdx', my_car_idx)
+                    for _d in _drivers_list:
+                        if _d.get('CarIdx') == _player_idx:
+                            _car_path = _d.get('CarPath', '')
+                            if _car_path:
+                                car_detected = True
+                                self._app.after(0, lambda c=_car_path:
+                                    self._app._on_car_detected(c))
+                            break
+
+                # Rival P1 last lap time (Feature 3)
+                car_idx_last_lap = ir['CarIdxLastLapTime'] or []
+                rival_p1_last_lap = 0.0
+                try:
+                    if car_idx_positions and car_idx_last_lap:
+                        for _ci2, _pos2 in enumerate(car_idx_positions):
+                            if _pos2 == 1 and _ci2 != my_car_idx:
+                                _t = car_idx_last_lap[_ci2] if _ci2 < len(car_idx_last_lap) else 0.0
+                                if _t and _t > 0:
+                                    rival_p1_last_lap = float(_t)
+                                break
+                except Exception:
+                    pass
+
                 fuel = fuel_raw
 
                 # Rolling fuel-per-lap delta (lap-boundary triggered)
@@ -756,6 +787,9 @@ class TelemetryThread(threading.Thread):
                         'on_pit_road':        player_on_pit,
                         'is_on_track':        is_on_track,
                         'stale':              False,
+                        'car_idx_f2time':     list(car_idx_f2time),
+                        'player_car_idx':     my_car_idx,
+                        'rival_p1_last_lap':  rival_p1_last_lap,
                     },
                     'damage': {
                         'pit_repair_s':      round(pit_repair_left, 1),
@@ -999,6 +1033,13 @@ class App(tk.Tk):
         self._last_driver_swap_alert: float = 0.0
         self._muted: bool = False
 
+        # ── New feature state ─────────────────────────────────────────────
+        self._prev_on_pit_road: bool = False       # Feature 1: gap on pit exit
+        self._stint_lap: int = 0                   # Feature 4: stint lap counter
+        self._did_pit_this_lap: bool = False       # Feature 4: pit detected this lap
+        self._driving_mode: str = 'normal'         # Feature 5: push/conserve mode
+        self._current_car_path: str = ''           # Feature 8: per-car config
+
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
         style.theme_use('clam')
@@ -1062,6 +1103,9 @@ class App(tk.Tk):
         self.v_vad_sensitivity = tk.DoubleVar(
             value=self._cfg.get('vad_sensitivity', DEFAULTS['vad_sensitivity']))
         self.v_wake_word = tk.StringVar(value=self._cfg.get('wake_word', DEFAULTS['wake_word']))
+        _scl_raw = self._cfg.get('stint_callout_laps', DEFAULTS['stint_callout_laps'])
+        self.v_stint_callout = tk.StringVar(value='off' if not _scl_raw else str(_scl_raw))
+        self.v_whisper_model = tk.StringVar(value=self._cfg.get('whisper_model', DEFAULTS['whisper_model']))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue(maxsize=5)
@@ -1083,9 +1127,8 @@ class App(tk.Tk):
         self.after(100, self._check_auth_on_boot)
 
         # ── Update check (background, 3 s delay so UI is ready first) ────
-        if getattr(sys, 'frozen', False):
-            self.after(3000, lambda: threading.Thread(
-                target=self._check_for_update, daemon=True).start())
+        self.after(3000, lambda: threading.Thread(
+            target=self._check_for_update, daemon=True).start())
 
     # ── UI builders ──────────────────────────────────────────────────────────
 
@@ -1321,6 +1364,25 @@ class App(tk.Tk):
                                         bg=BG2, fg=TEXT, font=('Segoe UI', 9), width=5)
         self._vad_sens_label.pack(side='left', padx=(6, 0))
 
+        # Row 14: Stint lap callout frequency
+        ttk.Label(frm, text='Stint callout every').grid(row=14, column=0, sticky='w', pady=3, padx=(0, 10))
+        stint_cb = ttk.Combobox(frm, textvariable=self.v_stint_callout,
+                                values=['off', '3', '5', '10'], state='readonly', width=8)
+        stint_cb.grid(row=14, column=1, sticky='w', pady=3)
+        ttk.Label(frm, text='laps').grid(row=14, column=2, sticky='w', pady=3)
+        stint_cb.bind('<<ComboboxSelected>>', lambda _: self._save_stint_callout_pref())
+
+        # Row 15: Whisper model selector
+        ttk.Label(frm, text='Whisper model').grid(row=15, column=0, sticky='w', pady=3, padx=(0, 10))
+        whisper_cb = ttk.Combobox(frm, textvariable=self.v_whisper_model,
+                                  values=['tiny', 'base', 'small', 'medium'],
+                                  state='readonly', width=10)
+        whisper_cb.grid(row=15, column=1, sticky='w', pady=3)
+        tk.Label(frm, text='Restart required to apply',
+                 bg=BG2, fg=DIM, font=('Segoe UI', 8)).grid(
+                     row=15, column=2, sticky='w', pady=3, padx=(6, 0))
+        whisper_cb.bind('<<ComboboxSelected>>', lambda _: self._save_whisper_model_pref())
+
     def _save_fuel_unit_pref(self):
         self._cfg['fuel_unit'] = self.v_fuel_unit.get()
         save_config(self._cfg)
@@ -1357,7 +1419,7 @@ class App(tk.Tk):
     def _save_checkin_mins_pref(self):
         val = self.v_checkin_mins.get()
         self._cfg['checkin_mins'] = 0 if val == 'off' else int(val)
-        save_config(self._cfg)
+        self._save_cfg()
 
     def _save_rate_pref(self):
         rate = self.v_tts_rate.get()
@@ -1387,6 +1449,74 @@ class App(tk.Tk):
         self._vad_sens_label.config(text=f'{val:.3f}')
         save_config(self._cfg)
 
+    def _save_stint_callout_pref(self):
+        val = self.v_stint_callout.get()
+        self._cfg['stint_callout_laps'] = 0 if val == 'off' else int(val)
+        self._save_cfg()
+
+    def _save_whisper_model_pref(self):
+        self._cfg['whisper_model'] = self.v_whisper_model.get()
+        save_config(self._cfg)
+
+    def _save_cfg(self):
+        """Save main config and also persist per-car subset if a car is loaded."""
+        save_config(self._cfg)
+        if self._current_car_path:
+            self._save_car_cfg(self._current_car_path)
+
+    def _car_cfg_path(self, car_path: str) -> str:
+        safe = car_path.replace('/', '_').replace('\\', '_').replace(' ', '_')
+        return os.path.join(APPDATA_DIR, f'config_car_{safe}.json')
+
+    def _on_car_detected(self, car_path: str):
+        """Called on main thread when TelemetryThread identifies the player car."""
+        if car_path == self._current_car_path:
+            return  # already loaded
+        self._current_car_path = car_path
+        cfg_path = self._car_cfg_path(car_path)
+        if os.path.exists(cfg_path):
+            try:
+                with open(cfg_path) as f:
+                    car_cfg = json.load(f)
+                CAR_KEYS = ('fuel_burn_rate', 'fuel_capacity', 'stint_callout_laps', 'checkin_mins')
+                for k in CAR_KEYS:
+                    if k in car_cfg:
+                        self._cfg[k] = car_cfg[k]
+                # Sync UI vars that may have changed
+                _scl = self._cfg.get('stint_callout_laps', 0)
+                self.v_stint_callout.set('off' if not _scl else str(_scl))
+                _cm = self._cfg.get('checkin_mins', 0)
+                self.v_checkin_mins.set('off' if not _cm else str(_cm))
+                self.log(f'[CAR] Loaded per-car config for {car_path}')
+            except Exception as e:
+                self.log(f'[CAR] Could not load per-car config: {e}')
+        else:
+            self.log(f'[CAR] No per-car config for {car_path} — using defaults')
+
+    def _save_car_cfg(self, car_path: str):
+        CAR_KEYS = ('fuel_burn_rate', 'fuel_capacity', 'stint_callout_laps', 'checkin_mins')
+        try:
+            car_cfg = {k: self._cfg[k] for k in CAR_KEYS if k in self._cfg}
+            with open(self._car_cfg_path(car_path), 'w') as f:
+                json.dump(car_cfg, f, indent=2)
+        except Exception as e:
+            self.log(f'[CAR] Could not save per-car config: {e}')
+
+    def _update_driving_mode(self, mode: str):
+        """Set push/conserve/normal driving mode, speak confirmation, update UI label."""
+        self._driving_mode = mode
+        if mode == 'push':
+            msg = 'Push mode active. Chasing maximum pace.'
+            self._mode_label.config(text='MODE: PUSH', fg=YELLOW, bg=BG)
+        elif mode == 'conserve':
+            msg = 'Conserve mode active. Prioritising fuel economy.'
+            self._mode_label.config(text='MODE: CONSERVE', fg=CYAN, bg=BG)
+        else:
+            msg = 'Normal mode.'
+            self._mode_label.config(text='', fg=BG, bg=BG)
+        self.speak(msg)
+        self.log(f'[MODE] Driving mode set to {mode}')
+
     def _update_pitwall_btn(self):
         if self._server_session_id:
             self.pitwall_btn.pack(side='left')
@@ -1408,7 +1538,29 @@ class App(tk.Tk):
         if not result:
             return
         tag, exe_url = result
-        self.after(0, lambda: self._prompt_update(tag, exe_url))
+        self.after(0, lambda: self._show_update_notification(tag, exe_url))
+
+    def _show_update_notification(self, tag: str, exe_url: str):
+        """Show a persistent header label and optionally the full update dialog."""
+        # Add a clickable label to the header canvas area
+        try:
+            if not hasattr(self, '_update_notify_label'):
+                import webbrowser
+                self._update_notify_label = tk.Label(
+                    self, text=f'⬆ v{tag} available — click to download',
+                    bg=YELLOW, fg='#000000',
+                    font=('Segoe UI', 9, 'bold'), cursor='hand2', padx=8, pady=2,
+                )
+                self._update_notify_label.pack(fill='x')
+                self._update_notify_label.bind(
+                    '<Button-1>',
+                    lambda _: webbrowser.open(
+                        f'https://github.com/{GITHUB_REPO}/releases/latest'))
+        except Exception:
+            pass
+        # Also show the full dialog if running as EXE (supports auto-install)
+        if getattr(sys, 'frozen', False):
+            self._prompt_update(tag, exe_url)
 
     def _prompt_update(self, tag: str, exe_url: str):
         """Show update dialog on the main thread."""
@@ -1704,6 +1856,9 @@ class App(tk.Tk):
         self._ack_label = tk.Label(bf, text='', bg=BG, fg=BG,
                                    font=('Segoe UI', 8, 'bold'))
         self._ack_label.pack(side='left', padx=(4, 0))
+        self._mode_label = tk.Label(bf, text='', bg=BG, fg=BG,
+                                    font=('Segoe UI', 8, 'bold'))
+        self._mode_label.pack(side='left', padx=(6, 0))
         tk.Label(bf, text='iRacing must be running before starting.',
                  bg=BG, fg=DIM, font=('Segoe UI', 8)).pack(side='right')
 
@@ -3117,6 +3272,9 @@ class App(tk.Tk):
         self._last_fuel_diverge_alert = 0.0
         self._last_position_alert    = 0.0
         self._last_driver_swap_alert = 0.0
+        self._prev_on_pit_road       = False
+        self._stint_lap              = 0
+        self._did_pit_this_lap       = False
 
         self._stop_evt.clear()
         self._running = True
@@ -3358,12 +3516,14 @@ class App(tk.Tk):
                 self._speak_pit_briefing(live, tele)
 
             # Fuel save coaching — fires when driver won't make pit window on current burn
+            # Feature 5: conserve mode lowers threshold (fires even with small margin deficit)
+            _fuel_save_margin = 0.5 if self._driving_mode == 'conserve' else 0.0
             if (not coaching_suppressed
                     and fuel_laps_measured >= 3
                     and laps_until_pit is not None and laps_until_pit > 0
                     and laps_of_fuel is not None
                     and avg_fpl and fuel_sensor
-                    and laps_of_fuel < laps_until_pit
+                    and laps_of_fuel < (laps_until_pit + _fuel_save_margin)
                     and current_lap_now > self._last_fuel_save_lap + 5
                     and not self._coaching_in_flight):
                 target_fpl = fuel_sensor / laps_until_pit
@@ -3547,6 +3707,35 @@ class App(tk.Tk):
                     self.log(f'[INCIDENT] {msg}')
                     self._last_incident_alert = now
             self._prev_incidents = max(self._prev_incidents, incidents_now)
+
+            # Feature 1 — Gap on pit exit
+            on_pit_now = tele.get('on_pit_road', False)
+            if self._prev_on_pit_road and not on_pit_now:
+                # Transition from pit road to track
+                try:
+                    f2time    = tele.get('car_idx_f2time', [])
+                    my_idx    = tele.get('player_car_idx', 0)
+                    opp_data  = tele.get('opponents', {})
+                    ahead     = opp_data.get('ahead')
+                    behind    = opp_data.get('behind')
+                    my_pos    = opp_data.get('my_position')
+                    parts     = ['Out of the pits']
+                    if ahead and ahead.get('gap') is not None:
+                        parts.append(f"{ahead['gap']:.1f}s to P{ahead['position']}")
+                    if behind and behind.get('gap') is not None:
+                        parts.append(f"P{behind['position']} is {behind['gap']:.1f}s behind")
+                    if len(parts) > 1:
+                        pit_exit_msg = parts[0] + ' — ' + ', '.join(parts[1:])
+                    else:
+                        pit_exit_msg = 'Out of the pits.'
+                    self._say('pit_exit_gap', pit_exit_msg, 0)
+                    self.log(f'[PIT EXIT] {pit_exit_msg}')
+                except Exception as _pe:
+                    self.log(f'[PIT EXIT] Gap calc error: {_pe}')
+                # Feature 4 — reset stint lap counter on pit exit
+                self._stint_lap = 0
+                self._did_pit_this_lap = True
+            self._prev_on_pit_road = on_pit_now
 
     # ── Keyboard listener (push-to-talk) ─────────────────────────────────────
 
@@ -3975,6 +4164,16 @@ class App(tk.Tk):
             if any(_ql == p or _ql.startswith(p + ' ') or _ql.startswith(p + ',')
                    for p in _ACK_PHRASES):
                 self._acknowledge()
+                return
+            # Feature 5 — Push/conserve mode voice commands
+            if any(k in _ql for k in ('push mode', 'push harder', 'maximum attack')):
+                self.after(0, lambda: self._update_driving_mode('push'))
+                return
+            if any(k in _ql for k in ('conserve', 'save fuel', 'fuel save mode', 'conservation mode', 'fuel saving mode')):
+                self.after(0, lambda: self._update_driving_mode('conserve'))
+                return
+            if any(k in _ql for k in ('normal mode', 'reset mode', 'back to normal')):
+                self.after(0, lambda: self._update_driving_mode('normal'))
                 return
             # Route pit-strategy and fuel-save questions to focused handlers
             _pit_keywords    = ('pit', 'box', 'stop', 'stay out', 'extend')
@@ -4419,13 +4618,31 @@ class App(tk.Tk):
         # Read current position from context for the lap record
         with self._ctx_lock:
             ctx = self._ctx
-        pos = ctx.get('telemetry', {}).get('opponents', {}).get('my_position') if ctx else None
+        tele_snap = ctx.get('telemetry', {}) if ctx else {}
+        pos = tele_snap.get('opponents', {}).get('my_position')
         self._record_server_lap(lap_num, lap_time, fpl, pos)
+
+        # Feature 4 — Stint lap counter
+        if self._did_pit_this_lap:
+            self._stint_lap = 1
+            self._did_pit_this_lap = False
+        else:
+            self._stint_lap += 1
+        _scl = self._cfg.get('stint_callout_laps', DEFAULTS['stint_callout_laps'])
+        if _scl and self._stint_lap > 0 and self._stint_lap % _scl == 0:
+            self._say(f'stint_lap_{self._stint_lap}',
+                      f"Lap {self._stint_lap} of your stint.", 0)
+
+        # Feature 3 — Rival P1 lap tracking context (folded into coaching below)
+        rival_p1_time = tele_snap.get('rival_p1_last_lap', 0.0)
 
         is_pb = (lap_time == self._session_best_lap and len(self._lap_times_this_session) > 1)
         recent = self._lap_times_this_session[-5:]
         avg    = sum(recent) / len(recent) if recent else lap_time
-        is_slow = len(recent) >= 3 and lap_time > avg * 1.03
+
+        # Feature 5 — push mode tightens the "slow" threshold
+        _slow_threshold = 0.2 if self._driving_mode == 'push' else 0.5
+        is_slow = len(recent) >= 3 and lap_time > (avg + _slow_threshold)
         _ci = self._cfg.get('checkin_laps', 5)
         is_check_in = bool(_ci) and (lap_num % _ci == 0)
 
@@ -4469,13 +4686,17 @@ class App(tk.Tk):
             target=self._ask_lap_coaching,
             args=(lap_num, lap_time, fpl, reason, st,
                   self._lap_sector_deltas.get(lap_num),
-                  self._per_lap_dynamics.get(lap_num)),
+                  self._per_lap_dynamics.get(lap_num),
+                  rival_p1_time,
+                  self._driving_mode),
             daemon=True,
         ).start()
 
     def _ask_lap_coaching(self, lap_num: int, lap_time: float, fpl, reason: str,
                           session_type: str = '', sector_deltas: dict | None = None,
-                          lap_dynamics: dict | None = None):
+                          lap_dynamics: dict | None = None,
+                          rival_p1_last_lap: float = 0.0,
+                          driving_mode: str = 'normal'):
         recent   = self._lap_times_this_session[-5:]
         avg      = sum(recent) / len(recent) if recent else lap_time
         imperial = (self._cfg.get('units_system', 'metric') == 'imperial')
@@ -4577,19 +4798,44 @@ class App(tk.Tk):
             f"when coaching sector-specific issues, name the relevant corners."
         ) if (track_name and sector_deltas) else ''
 
+        # Feature 3 — rival P1 context string
+        rival_str = ''
+        _pos = None
+        with self._ctx_lock:
+            _ctx_r = self._ctx
+        if _ctx_r:
+            _pos = _ctx_r.get('telemetry', {}).get('opponents', {}).get('my_position')
+        if rival_p1_last_lap and rival_p1_last_lap > 0 and lap_time > 0 and (_pos is None or _pos > 1):
+            _rival_delta = lap_time - rival_p1_last_lap
+            if _rival_delta > 0.5:
+                rival_str = (f" Leader last lap: {self._fmt_lap_spoken(rival_p1_last_lap)},"
+                             f" you are {_rival_delta:.1f}s slower.")
+            elif _rival_delta < -0.5:
+                rival_str = (f" You are {abs(_rival_delta):.1f}s faster than the leader's"
+                             f" last lap ({self._fmt_lap_spoken(rival_p1_last_lap)}).")
+
+        # Feature 5 — driving mode context string
+        mode_str = ''
+        if driving_mode == 'push':
+            mode_str = ' (Push mode active: prioritise lap time above all.)'
+        elif driving_mode == 'conserve':
+            mode_str = ' (Conserve mode: prioritise fuel economy over lap time.)'
+
         is_quali = session_type in self._QUALI_SESSION_TYPES
         if is_quali:
             question = (
                 f"Qualifying lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
                 f"{reason}. Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
-                f"Avg last 5: {self._fmt_lap_spoken(avg)}.{sector_str}{consistency_str}{track_hint} "
+                f"Avg last 5: {self._fmt_lap_spoken(avg)}.{sector_str}{consistency_str}{track_hint}"
+                f"{mode_str} "
                 f"This is a qualifying session — focus only on lap time and driving technique, "
                 f"no race strategy or fuel. The lap time was already read out — do not repeat it."
             )
         else:
             question = (
                 f"Lap {lap_num} complete. Time: {self._fmt_lap_spoken(lap_time)}. "
-                f"{fpl_str}{reason}.{sector_str}{consistency_str}{deg_str}{handling_str}{track_hint} "
+                f"{fpl_str}{reason}.{sector_str}{consistency_str}{deg_str}{handling_str}{track_hint}"
+                f"{rival_str}{mode_str} "
                 f"Session best: {self._fmt_lap_spoken(self._session_best_lap)}. "
                 f"Avg last 5: {self._fmt_lap_spoken(avg)}. "
                 f"The lap time was already announced to the driver — give brief coaching only, "
