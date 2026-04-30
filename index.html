@@ -210,7 +210,7 @@
       <span class="diamond">◈</span>
       Neural Racing Performance
     </div>
-    <a href="https://github.com/OblivionsPeak/neural-racing-performance/releases/latest">Latest Release</a>
+    <a href="https://github.com/OblivionsPeak/ai-race-engineer/releases/latest">Latest Release</a>
   </nav>
 
   <section class="hero">
@@ -221,7 +221,7 @@
       powered by AI and pulled directly from iRacing telemetry.
     </p>
     <a class="btn-download" id="dl-btn"
-       href="https://github.com/OblivionsPeak/neural-racing-performance/releases/latest/download/NeuralRacingPerformance.exe">
+       href="https://github.com/OblivionsPeak/ai-race-engineer/releases/latest/download/NeuralRacingPerformance.exe">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
         <polyline points="7 10 12 15 17 10"/>
@@ -235,33 +235,43 @@
   <section class="features">
     <div class="feature-card">
       <div class="feature-icon">🎙️</div>
-      <h3>Push-to-Talk</h3>
-      <p>Ask your engineer anything mid-race using a button or keyboard shortcut. Answers spoken back in real time.</p>
+      <h3>Voice Interface</h3>
+      <p>Push-to-talk, always-on VAD, or wake-word mode ("Hey Engineer"). Answers spoken back by a customisable AI voice.</p>
     </div>
     <div class="feature-card">
       <div class="feature-icon">⛽</div>
       <h3>Fuel Strategy</h3>
-      <p>Live fuel calculations, pit window predictions, and alerts before you run dry — all from iRacing telemetry.</p>
+      <p>Live sensor-based fuel calculations, pit window countdown alerts, and fuel-save coaching — no plan required.</p>
     </div>
     <div class="feature-card">
       <div class="feature-icon">🏎️</div>
-      <h3>Lap Coaching</h3>
-      <p>Automatic post-lap feedback on personal bests, slow laps, and pace trends without lifting a finger.</p>
+      <h3>Lap &amp; Sector Coaching</h3>
+      <p>Post-lap AI feedback on pace, sector deltas called live every lap, and trend analysis across the session.</p>
     </div>
     <div class="feature-card">
       <div class="feature-icon">🔧</div>
-      <h3>Setup Advice</h3>
-      <p>Hot tyre pressures and temperature spreads fed directly to the AI for camber, balance, and pressure guidance.</p>
+      <h3>Damage &amp; Engine Alerts</h3>
+      <p>Instant meatball flag detection, repair time reporting, engine warning alerts, and AI damage assessment.</p>
     </div>
     <div class="feature-card">
       <div class="feature-icon">📡</div>
       <h3>Spotter</h3>
-      <p>Proximity callouts so you always know what's alongside you, powered by live opponent position data.</p>
+      <p>Proximity callouts, flag announcements, position changes, and time-remaining alerts via a dedicated background thread.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🖥️</div>
+      <h3>Pit Wall Observer</h3>
+      <p>Share a live telemetry dashboard with your team. Throttle, brake, steering traces, lap chart, and AI log — in real time.</p>
     </div>
     <div class="feature-card">
       <div class="feature-icon">👥</div>
       <h3>Team Racing</h3>
       <p>Multi-driver stint planning, driver swap tracking, and per-driver fuel loads built in from the start.</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">🌦️</div>
+      <h3>Weather Awareness</h3>
+      <p>Track temperature change alerts, wet/dry condition detection, and weather-aware strategy coaching.</p>
     </div>
   </section>
 
@@ -361,7 +371,7 @@
   })();
 
   // ── Pull latest release tag for the download button ──────────────────────
-  fetch('https://api.github.com/repos/OblivionsPeak/neural-racing-performance/releases/latest')
+  fetch('https://api.github.com/repos/OblivionsPeak/ai-race-engineer/releases/latest')
     .then(r => r.json())
     .then(data => {
       const tag = data.tag_name;

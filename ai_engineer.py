@@ -18,7 +18,7 @@ import sys
 BACKEND_URL = "https://endurance-planner-production.up.railway.app"
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION     = "1.1.28"
+VERSION     = "1.1.29"
 GITHUB_REPO = "OblivionsPeak/ai-race-engineer"
 
 # ── Auto-install missing packages (script mode only — frozen EXE bundles all) ─
@@ -166,8 +166,9 @@ DEFAULTS = {
     'units_system':      'metric',
     'checkin_laps':      5,
     'tts_rate':          1.0,
-    'listen_mode':       'ptt',   # 'ptt' or 'vad'
+    'listen_mode':       'ptt',   # 'ptt', 'vad', or 'wake'
     'vad_sensitivity':   0.02,    # RMS threshold for voice activity detection
+    'wake_word':         'hey engineer',
 }
 
 def _c_to_f(c: float) -> float:  return c * 9 / 5 + 32
@@ -501,12 +502,18 @@ class TelemetryThread(threading.Thread):
                 if (0.31 < lap_dist_pct < 0.37 and sector_s1_delta is None
                         and lap_delta_ok and lap_delta_best is not None):
                     sector_s1_delta = round(float(lap_delta_best), 3)
+                    self._app.after(0, lambda d=sector_s1_delta:
+                        self._app._on_sector_delta('S1', d))
                 if (0.63 < lap_dist_pct < 0.69 and sector_s2_delta is None
                         and lap_delta_ok and lap_delta_best is not None):
                     sector_s2_delta = round(float(lap_delta_best), 3)
+                    self._app.after(0, lambda d=sector_s2_delta:
+                        self._app._on_sector_delta('S2', d))
                 if (0.92 < lap_dist_pct < 0.98 and sector_s3_delta is None
                         and lap_delta_ok and lap_delta_best is not None):
                     sector_s3_delta = round(float(lap_delta_best), 3)
+                    self._app.after(0, lambda d=sector_s3_delta:
+                        self._app._on_sector_delta('S3', d))
 
                 # Dynamics accumulation for end-of-lap handling analysis
                 dynamics_buffer.append(
@@ -949,6 +956,7 @@ class App(tk.Tk):
         self._last_strategy_lap: int = 0
         self._last_pit_briefed_stint: int = 0
         self._last_fuel_save_lap: int = 0
+        self._last_pit_window_alert_laps: int = 999
         self._track_history: dict = {}
         self._prev_session_type: str = ''
         self._session_debrief_triggered: bool = False
@@ -958,6 +966,7 @@ class App(tk.Tk):
         self._last_overcut_alert: float = 0.0
         self._last_weather_declared_wet: bool = False
         self._last_track_wetness: int = 0
+        self._last_track_temp_alerted_c: float | None = None
         self._gap_history: dict = {'ahead': [], 'behind': []}
         self._last_blue_flag_alert: float = 0.0
         self._prev_blue_flag: bool = False
@@ -1039,6 +1048,7 @@ class App(tk.Tk):
         self.v_listen_mode = tk.StringVar(value=self._cfg.get('listen_mode', 'ptt'))
         self.v_vad_sensitivity = tk.DoubleVar(
             value=self._cfg.get('vad_sensitivity', DEFAULTS['vad_sensitivity']))
+        self.v_wake_word = tk.StringVar(value=self._cfg.get('wake_word', DEFAULTS['wake_word']))
 
         # ── TTS queue (single engine, no double-speak) ────────────────────
         self._tts_queue  = queue.Queue(maxsize=5)
@@ -1253,17 +1263,30 @@ class App(tk.Tk):
                                     bg=BG2, fg=TEXT, font=('Segoe UI', 9), width=4)
         self._rate_label.pack(side='left', padx=(6, 0))
 
-        # Row 12: Listen Mode (PTT vs Always-On)
+        # Row 12: Listen Mode (PTT / VAD / Wake Word)
         ttk.Label(frm, text='Listen Mode').grid(row=12, column=0, sticky='w', pady=3, padx=(0, 10))
         listen_cb = ttk.Combobox(frm, textvariable=self.v_listen_mode,
-                                 values=['ptt', 'vad'], state='readonly', width=12)
+                                 values=['ptt', 'vad', 'wake'], state='readonly', width=12)
         listen_cb.grid(row=12, column=1, sticky='w', pady=3)
         listen_cb.bind('<<ComboboxSelected>>', lambda _: self._save_listen_mode_pref())
-        tk.Label(frm, text='ptt = hold button  |  vad = always listening',
+        tk.Label(frm, text='ptt = hold  |  vad = always-on  |  wake = wake word',
                  bg=BG2, fg=DIM, font=('Segoe UI', 8),
                  ).grid(row=12, column=2, sticky='w', pady=3, padx=(6, 0))
 
-        # Row 13: VAD Sensitivity (only meaningful in vad mode)
+        # Row 12b: Wake word entry (only shown when mode = wake)
+        self._wake_word_label = ttk.Label(frm, text='Wake Word')
+        self._wake_word_entry = ttk.Entry(frm, textvariable=self.v_wake_word, width=20)
+        self._wake_word_entry.bind('<FocusOut>', lambda _: self._save_wake_word_pref())
+        self._wake_word_entry.bind('<Return>',   lambda _: self._save_wake_word_pref())
+        self._wake_word_label.grid(row=12, column=3, sticky='w', pady=3, padx=(16, 4))
+        self._wake_word_entry.grid(row=12, column=4, sticky='w', pady=3)
+        # Show/hide based on current mode
+        self._update_wake_word_visibility()
+        listen_cb.bind('<<ComboboxSelected>>',
+                       lambda _: (self._save_listen_mode_pref(),
+                                  self._update_wake_word_visibility()))
+
+        # Row 13: VAD Sensitivity (only meaningful in vad/wake mode)
         ttk.Label(frm, text='VAD Sensitivity').grid(row=13, column=0, sticky='w', pady=3, padx=(0, 10))
         vad_frame = ttk.Frame(frm)
         vad_frame.grid(row=13, column=1, sticky='ew', pady=3, columnspan=2)
@@ -1321,6 +1344,18 @@ class App(tk.Tk):
     def _save_listen_mode_pref(self):
         self._cfg['listen_mode'] = self.v_listen_mode.get()
         save_config(self._cfg)
+
+    def _save_wake_word_pref(self):
+        self._cfg['wake_word'] = self.v_wake_word.get().strip().lower() or DEFAULTS['wake_word']
+        save_config(self._cfg)
+
+    def _update_wake_word_visibility(self):
+        if self.v_listen_mode.get() == 'wake':
+            self._wake_word_label.grid()
+            self._wake_word_entry.grid()
+        else:
+            self._wake_word_label.grid_remove()
+            self._wake_word_entry.grid_remove()
 
     def _save_vad_sensitivity_pref(self):
         val = self.v_vad_sensitivity.get()
@@ -2849,6 +2884,21 @@ class App(tk.Tk):
         self.log(f'[DAMAGE] {msg}')
         threading.Thread(target=self._ask_damage_report, daemon=True).start()
 
+    def _on_sector_delta(self, sector: str, delta: float):
+        """Fires on main thread when a sector split is captured vs session best."""
+        if not self._running:
+            return
+        if delta < -0.15:
+            msg = f"Purple {sector}"
+        elif delta < 0.0:
+            msg = f"Green {sector}, {delta:+.2f}"
+        elif delta < 0.4:
+            msg = f"{sector}: {delta:+.2f}"
+        else:
+            msg = f"Lost time in {sector}, {delta:+.2f}"
+        if self._say(f'sector_{sector.lower()}', msg, 5.0):
+            self.log(f'[SECTOR] {sector}: {delta:+.3f}s vs session best')
+
     def _ask_damage_report(self):
         """Ask the AI for a damage assessment immediately after damage is detected."""
         try:
@@ -2979,6 +3029,7 @@ class App(tk.Tk):
         self._last_strategy_lap          = 0
         self._last_pit_briefed_stint     = 0
         self._last_fuel_save_lap         = 0
+        self._last_pit_window_alert_laps = 999
         self._session_best_lap           = 0.0
         self._lap_times_this_session     = []
         self._session_started            = False
@@ -2993,6 +3044,7 @@ class App(tk.Tk):
         self._last_overcut_alert         = 0.0
         self._last_weather_declared_wet  = False
         self._last_track_wetness         = 0
+        self._last_track_temp_alerted_c  = None
         self._gap_history                = {'ahead': [], 'behind': []}
         self._last_blue_flag_alert       = 0.0
         self._prev_blue_flag             = False
@@ -3015,8 +3067,11 @@ class App(tk.Tk):
         listen_mode = self._cfg.get('listen_mode', 'ptt')
         if voice_ok:
             self.text_input_frame.pack_forget()
-            if listen_mode == 'vad':
-                self.talk_label.config(fg=DIM, bg=BG, text='● LISTENING…')
+            if listen_mode in ('vad', 'wake'):
+                _wake = self._cfg.get('wake_word', DEFAULTS['wake_word'])
+                _label = (f'● SAY  "{_wake.upper()}"…'
+                          if listen_mode == 'wake' else '● LISTENING…')
+                self.talk_label.config(fg=DIM, bg=BG, text=_label)
                 self._start_vad_listener()
             else:
                 self.talk_label.config(fg=DIM, bg=BG, text=f'HOLD  {btn_label}  TO  TALK')
@@ -3258,6 +3313,24 @@ class App(tk.Tk):
                         daemon=True,
                     ).start()
 
+            # Pit window countdown alerts — 5, 3, 2 laps out (before AI strategy fires at ≤1)
+            if (laps_until_pit is not None and pit_status in ('green', 'yellow')
+                    and sess_type_now.lower() in ('race', 'feature race', 'heat race', 'lone qualify')
+                    and not tele.get('on_pit_road')):
+                _alert = self._last_pit_window_alert_laps
+                if laps_until_pit == 5 and _alert > 5:
+                    if self._say('pit_window_5', "Pit window in five laps", 120):
+                        self.log('[PIT] Pit window 5 laps')
+                    self._last_pit_window_alert_laps = 5
+                elif laps_until_pit == 3 and _alert > 3:
+                    if self._say('pit_window_3', "Pit window in three laps", 120):
+                        self.log('[PIT] Pit window 3 laps')
+                    self._last_pit_window_alert_laps = 3
+                elif laps_until_pit == 2 and _alert > 2:
+                    if self._say('pit_window_2', "Two laps to pit window", 120):
+                        self.log('[PIT] Pit window 2 laps')
+                    self._last_pit_window_alert_laps = 2
+
             # Proactive pit strategy — fires once when window opens (laps_until_pit == 0 or 1)
             if (pit_status in ('open', 'green')
                     and laps_until_pit is not None and laps_until_pit <= 1
@@ -3294,6 +3367,29 @@ class App(tk.Tk):
                     self._last_weather_alert = now
             elif wetness_now < 2 and self._last_track_wetness >= 4:
                 self._last_track_wetness = wetness_now  # track has dried, reset silently
+
+            # Track temp change alert — fires when temp shifts ≥5°C from last alerted value
+            track_temp_now = weather.get('track_temp_c')
+            if track_temp_now is not None:
+                if self._last_track_temp_alerted_c is None:
+                    self._last_track_temp_alerted_c = track_temp_now
+                elif abs(track_temp_now - self._last_track_temp_alerted_c) >= 5.0 \
+                        and now - self._last_weather_alert > 120:
+                    delta_t = track_temp_now - self._last_track_temp_alerted_c
+                    direction = 'risen' if delta_t > 0 else 'dropped'
+                    units = self._cfg.get('units_system', 'metric')
+                    if units == 'imperial':
+                        t_disp  = f"{_c_to_f(track_temp_now):.0f}°F"
+                        d_disp  = f"{abs(delta_t * 9/5):.0f}°F"
+                    else:
+                        t_disp  = f"{track_temp_now:.0f}°C"
+                        d_disp  = f"{abs(delta_t):.0f}°C"
+                    msg = (f"Track temperature has {direction} by {d_disp} to {t_disp}. "
+                           f"Tyre grip window may have shifted.")
+                    if self._say('track_temp_change', msg, 300):
+                        self.log(f'[WEATHER] {msg}')
+                        self._last_track_temp_alerted_c = track_temp_now
+                        self._last_weather_alert = now
 
             # Blue flag alert
             flags    = ctx.get('session_flags', {})
@@ -3721,8 +3817,12 @@ class App(tk.Tk):
             self.after(0, self._reset_talk_label)
 
     def _reset_talk_label(self):
-        if self._cfg.get('listen_mode', 'ptt') == 'vad':
+        mode = self._cfg.get('listen_mode', 'ptt')
+        if mode == 'vad':
             self.talk_label.config(bg=BG, fg=DIM, text='● LISTENING…')
+        elif mode == 'wake':
+            _wake = self._cfg.get('wake_word', DEFAULTS['wake_word'])
+            self.talk_label.config(bg=BG, fg=DIM, text=f'● SAY  "{_wake.upper()}"…')
         else:
             binding   = self._cfg.get('ptt_binding', DEFAULTS['ptt_binding'])
             btn_label = _binding_label(binding)
@@ -3788,6 +3888,20 @@ class App(tk.Tk):
             if not question:
                 self.after(0, self._reset_talk_label)
                 return
+            # Wake word gate — if mode is 'wake', transcription must contain the phrase
+            if self._cfg.get('listen_mode', 'ptt') == 'wake':
+                wake = self._cfg.get('wake_word', DEFAULTS['wake_word']).lower()
+                q_lower = question.lower()
+                if wake not in q_lower:
+                    self.log(f'[WAKE] Wake word not detected, ignoring utterance')
+                    self.after(0, self._reset_talk_label)
+                    return
+                # Strip the wake phrase from the front of the question
+                idx = q_lower.find(wake)
+                question = question[idx + len(wake):].lstrip(' ,.')
+                if not question:
+                    self.after(0, self._reset_talk_label)
+                    return
             self.log(f'You: "{question}"')
             # Route pit-strategy and fuel-save questions to focused handlers
             _ql = question.lower()
