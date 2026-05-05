@@ -441,7 +441,9 @@ class TelemetryThread(threading.Thread):
         self._app  = app_ref
         self._stop = threading.Event()
         self._ir   = None  # irsdk instance — set in run() for send_pit_command access
-        self._rival_on_pit_prev: dict = {}  # slot → bool: rival pit road state (Feature 1 v1.1.37)
+        self._rival_on_pit_prev: dict = {}   # slot → bool: rival pit road state (Feature 1 v1.1.37)
+        self._prev_car_last_lap: dict = {}   # car_idx → last seen CarIdxLastLapTime for change detection
+        self._driver_on_pit_prev: dict = {}  # car_idx → bool, for stint boundary detection
 
     def stop(self):
         self._stop.set()
@@ -926,6 +928,50 @@ class TelemetryThread(threading.Thread):
                 except Exception as _rpe:
                     self._app.log(f'[RIVAL] Pit tracking error: {_rpe}')
 
+                # Per-driver lap time tracking for team strategy optimiser
+                try:
+                    _yellow_out = bool(session_flags & 0x0008)
+                    _drv_list   = driver_info.get('Drivers', []) or []
+                    for _drv in _drv_list:
+                        _ci = _drv.get('CarIdx', -1)
+                        if _ci < 0 or _ci == my_car_idx:
+                            continue
+                        _cls = car_idx_class[_ci] if _ci < len(car_idx_class) else None
+                        if _cls != player_car_class:
+                            continue
+                        _is_pit = bool(car_idx_on_pit[_ci]) if _ci < len(car_idx_on_pit) else False
+                        _was_pit = self._driver_on_pit_prev.get(_ci, False)
+                        self._driver_on_pit_prev[_ci] = _is_pit
+                        # Pit exit → new stint
+                        if not _is_pit and _was_pit:
+                            pace = self._app._teammate_pace.get(_ci)
+                            if pace:
+                                pace['stint_laps'] = []
+                                pace['stint_num']  = pace.get('stint_num', 0) + 1
+                        _lt = car_idx_last_lap[_ci] if _ci < len(car_idx_last_lap) else None
+                        if not _lt or _lt <= 0:
+                            continue
+                        if _lt == self._prev_car_last_lap.get(_ci):
+                            continue
+                        self._prev_car_last_lap[_ci] = _lt
+                        # Filter: skip yellow, pit in/out laps, outliers
+                        if _yellow_out or _was_pit or _is_pit:
+                            continue
+                        if not (55.0 < _lt < 600.0):
+                            continue
+                        _name = _drv.get('UserName', f'Car {_ci}')
+                        pace = self._app._teammate_pace.setdefault(_ci, {
+                            'name': _name, 'class_id': _cls,
+                            'laps': [], 'stint_laps': [], 'stint_num': 0,
+                        })
+                        pace['name'] = _name
+                        pace['laps'].append(_lt)
+                        pace['laps'] = pace['laps'][-40:]
+                        pace['stint_laps'].append(_lt)
+                        pace['stint_laps'] = pace['stint_laps'][-40:]
+                except Exception as _dpe:
+                    self._app.log(f'[STRATEGY] Pace tracking error: {_dpe}')
+
                 # Gap to class leader (Feature 8-new)
                 gap_to_leader_s = 0.0
                 try:
@@ -1259,6 +1305,8 @@ class App(tk.Tk):
         # New v1.1.37 feature state
         self._rival_pit_laps: dict = {}               # F1: slot → lap_num when rival pitted
         self._compound_laps: int = 0                  # F4: laps completed on current tyre set
+        self._teammate_pace: dict = {}                # strategy: car_idx → driver pace data
+        self._strategy_in_flight: bool = False        # strategy: prevent concurrent requests
 
         # ── Style ────────────────────────────────────────────────────────
         style = ttk.Style(self)
@@ -1343,6 +1391,7 @@ class App(tk.Tk):
         self._build_config(cfg)
         self._build_status_and_buttons()
         self._build_stint_panel()
+        self._build_strategy_panel()
         self._build_voice_section()
         self._build_qa_display()
         self._build_log()
@@ -2206,6 +2255,179 @@ class App(tk.Tk):
             font=('Segoe UI', 9, 'italic'),
         )
         self._waiting_label.grid(row=8, column=0, columnspan=4, pady=(4, 0))
+
+    def _build_strategy_panel(self):
+        sf = ttk.LabelFrame(self, text='TEAM STRATEGY', padding=8)
+        sf.pack(fill='x', padx=14, pady=4)
+
+        # Driver pace table
+        cols = ('driver', 'avg', 'best', 'stint_avg', 'laps')
+        self._strategy_tree = ttk.Treeview(
+            sf, columns=cols, show='headings', height=4,
+            style='Strategy.Treeview',
+        )
+        style = ttk.Style()
+        style.configure('Strategy.Treeview',
+                        background=BG3, foreground=TEXT, fieldbackground=BG3,
+                        rowheight=20, font=('Segoe UI', 8))
+        style.configure('Strategy.Treeview.Heading',
+                        background=BG2, foreground=DIM, font=('Segoe UI', 7, 'bold'))
+        style.map('Strategy.Treeview', background=[('selected', BG3)])
+
+        hdrs = [('driver', 'Driver', 140), ('avg', 'Avg Lap', 60),
+                ('best', 'Best', 60), ('stint_avg', 'Stint Avg', 70), ('laps', 'Laps', 40)]
+        for cid, hdr, w in hdrs:
+            self._strategy_tree.heading(cid, text=hdr)
+            self._strategy_tree.column(cid, width=w, anchor='center' if cid != 'driver' else 'w')
+        self._strategy_tree.pack(fill='x', pady=(0, 6))
+
+        btn_row = ttk.Frame(sf)
+        btn_row.pack(fill='x')
+        self._opt_btn = ttk.Button(
+            btn_row, text='OPTIMISE STINTS', style='Browse.TButton',
+            command=lambda: threading.Thread(
+                target=self._run_strategy_optimiser, daemon=True).start(),
+        )
+        self._opt_btn.pack(side='left')
+        self._strategy_status = tk.StringVar(value='')
+        tk.Label(btn_row, textvariable=self._strategy_status,
+                 bg=BG2, fg=DIM, font=('Segoe UI', 8)).pack(side='left', padx=(10, 0))
+
+        # Periodic table refresh
+        self._refresh_strategy_table()
+
+    def _refresh_strategy_table(self):
+        """Update driver pace table from current teammate_pace data."""
+        try:
+            tree = self._strategy_tree
+            for row in tree.get_children():
+                tree.delete(row)
+
+            def _fmt(t):
+                if t is None: return '—'
+                m, s = divmod(t, 60)
+                return f"{int(m)}:{s:06.3f}"
+
+            for ci, pace in sorted(self._teammate_pace.items(),
+                                   key=lambda kv: kv[1].get('name', '')):
+                laps = pace.get('laps', [])
+                stint_laps = pace.get('stint_laps', [])
+                if not laps:
+                    continue
+                avg = sum(laps) / len(laps)
+                best = min(laps)
+                stint_avg = sum(stint_laps) / len(stint_laps) if stint_laps else None
+                tree.insert('', 'end', values=(
+                    pace.get('name', f'Car {ci}'),
+                    _fmt(avg), _fmt(best), _fmt(stint_avg), len(laps),
+                ))
+        except Exception:
+            pass
+        self.after(5000, self._refresh_strategy_table)
+
+    def _run_strategy_optimiser(self):
+        """Ask Claude for an optimal stint plan based on collected driver pace data."""
+        if self._strategy_in_flight:
+            self._strategy_status.set('Already running…')
+            return
+        token = self._cfg.get('token', '')
+        if not token:
+            self._strategy_status.set('Not logged in')
+            return
+
+        pace_data = dict(self._teammate_pace)
+        if not pace_data:
+            self._strategy_status.set('No teammate pace data yet')
+            return
+
+        self._strategy_in_flight = True
+        self._strategy_status.set('Analysing…')
+        self._opt_btn.state(['disabled'])
+
+        try:
+            with self._ctx_lock:
+                ctx = self._ctx
+            plan = self._plan or {}
+
+            def _fmt(t):
+                if t is None: return '?'
+                m, s = divmod(t, 60)
+                return f"{int(m)}:{s:06.3f}"
+
+            driver_lines = []
+            for ci, pace in sorted(pace_data.items(), key=lambda kv: kv[1].get('name', '')):
+                laps = pace.get('laps', [])
+                stint_laps = pace.get('stint_laps', [])
+                if not laps:
+                    continue
+                avg = sum(laps) / len(laps)
+                best = min(laps)
+                recent = laps[-5:] if len(laps) >= 5 else laps
+                recent_avg = sum(recent) / len(recent)
+                # Tyre deg: compare first 5 laps avg vs last 5 laps avg of session
+                deg_str = '?'
+                if len(laps) >= 10:
+                    early = laps[:5]; late = laps[-5:]
+                    deg_s = (sum(late) / len(late)) - (sum(early) / len(early))
+                    deg_str = f"+{deg_s:.2f}s per stint" if deg_s > 0 else f"{deg_s:.2f}s per stint"
+                stint_avg = sum(stint_laps) / len(stint_laps) if stint_laps else None
+                driver_lines.append(
+                    f"  {pace.get('name', f'Car {ci}')}: "
+                    f"session avg {_fmt(avg)}, best {_fmt(best)}, "
+                    f"recent ({len(recent)} laps) {_fmt(recent_avg)}, "
+                    f"current stint avg {_fmt(stint_avg)}, "
+                    f"tyre degradation {deg_str}, "
+                    f"{len(laps)} laps measured"
+                )
+
+            race_dur = plan.get('race_duration_mins') or plan.get('race_laps')
+            total_stints = plan.get('total_stints', '?')
+            track = plan.get('track', 'unknown track')
+            car = plan.get('car', 'unknown car')
+            pit_loss = self._cfg.get('pit_loss_s', 25)
+            time_rem_str = '?'
+            if ctx:
+                tr = ctx.get('telemetry', {}).get('session', {}).get('time_remaining_s')
+                lr = ctx.get('telemetry', {}).get('session', {}).get('laps_remaining')
+                if tr and tr > 0:
+                    time_rem_str = f"{tr/3600:.2f}h ({tr/60:.0f} min) remaining"
+                elif lr:
+                    time_rem_str = f"{lr} laps remaining"
+
+            question = (
+                f"Team strategy optimisation for {track} in the {car}.\n"
+                f"Race: {race_dur}, {total_stints} planned stints, {pit_loss}s estimated pit loss.\n"
+                f"Time/laps remaining: {time_rem_str}.\n\n"
+                f"DRIVER PACE DATA (session):\n" + "\n".join(driver_lines) + "\n\n"
+                f"Based on this pace data, recommend the optimal driver stint order and stint lengths "
+                f"for the remainder of the race. Consider tyre degradation, recent pace trends, "
+                f"and minimising total race time. List each remaining stint as: "
+                f"Stint N — Driver Name — target length — reasoning. "
+                f"Be specific with lap counts or duration. Maximum 8 sentences total."
+            )
+
+            system_prompt = self._build_system_prompt(ctx) if ctx else (
+                "You are a precise race strategist. Be concise and data-driven. No preamble."
+            )
+
+            r = requests.post(
+                f'{BACKEND_URL}/engineer/coaching',
+                json={'token': token, 'system_prompt': system_prompt, 'question': question},
+                timeout=30,
+            )
+            if r.ok:
+                answer = r.json().get('answer', '').strip()
+                self.after(0, lambda a=answer: self._append_qa('[Strategy]', a))
+                self.after(0, lambda: self._strategy_status.set('Done — see Q&A'))
+                self.log(f'[STRATEGY] Optimisation complete')
+            else:
+                self.after(0, lambda: self._strategy_status.set('Request failed'))
+        except Exception as e:
+            self.log(f'[STRATEGY] Error: {e}')
+            self.after(0, lambda: self._strategy_status.set('Error — check log'))
+        finally:
+            self._strategy_in_flight = False
+            self.after(0, lambda: self._opt_btn.state(['!disabled']))
 
     def _build_voice_section(self):
         vf = ttk.Frame(self)
@@ -3850,6 +4072,8 @@ class App(tk.Tk):
         self._prev_lap_num_caution   = 0
         self._rival_pit_laps         = {}
         self._compound_laps          = 0
+        self._teammate_pace          = {}
+        self._strategy_in_flight     = False
 
         self._stop_evt.clear()
         self._running = True
@@ -5150,6 +5374,14 @@ class App(tk.Tk):
                 self.after(0, self._reset_talk_label)
                 return
 
+            if any(k in _ql for k in ('optimise strategy', 'optimize strategy',
+                                       'run strategy', 'strategy optimise', 'strategy optimize',
+                                       'driver pace', 'team strategy', 'stint optimise',
+                                       'stint optimize')):
+                threading.Thread(target=self._run_strategy_optimiser, daemon=True).start()
+                self.after(0, self._reset_talk_label)
+                return
+
             # Route pit-strategy and fuel-save questions to focused handlers
             _pit_keywords    = ('pit', 'box', 'stop', 'stay out', 'extend')
             _strategy_intent = ('should', 'when', 'now', 'this lap', 'strategy', 'call')
@@ -5194,7 +5426,8 @@ class App(tk.Tk):
             "weather, or lap pace. Quick commands: say 'push mode' or 'conserve mode' to change driving intent, "
             "'copy' to snooze coaching, 'add X litres' to set pit fuel, "
             "'change all tyres' or 'no tyre change' to set tyre service, "
-            "'fast repair' to request a fast repair, and 'normal mode' to reset."
+            "'fast repair' to request a fast repair, 'normal mode' to reset, "
+            "and 'optimise strategy' to get an AI stint plan based on teammate pace data."
         )
         self.speak(msg)
         self.log('[HELP] Voice command list spoken')
@@ -5568,6 +5801,30 @@ class App(tk.Tk):
             if len(self._pit_stop_log) > 1:
                 avg_dur = sum(p['duration_s'] for p in self._pit_stop_log) / len(self._pit_stop_log)
                 lines.append(f"  Avg over {len(self._pit_stop_log)} stops: {avg_dur:.1f}s")
+
+        # Teammate pace summary (for strategy context)
+        if self._teammate_pace:
+            def _fmtt(t):
+                m, s = divmod(t, 60)
+                return f"{int(m)}:{s:06.3f}"
+            pace_lines = []
+            for _ci, _pace in sorted(self._teammate_pace.items(),
+                                      key=lambda kv: kv[1].get('name', '')):
+                _laps = _pace.get('laps', [])
+                if not _laps:
+                    continue
+                _avg = sum(_laps) / len(_laps)
+                _best = min(_laps)
+                _sl = _pace.get('stint_laps', [])
+                _sa = f" stint {_fmtt(sum(_sl)/len(_sl))}" if _sl else ""
+                pace_lines.append(
+                    f"  {_pace.get('name', f'Car {_ci}')}: "
+                    f"avg {_fmtt(_avg)} best {_fmtt(_best)}{_sa} ({len(_laps)} laps)"
+                )
+            if pace_lines:
+                lines.append("")
+                lines.append("TEAMMATE PACE (same class, session averages):")
+                lines.extend(pace_lines)
 
         lines.append("")
         lines.append("STINT PLAN SUMMARY:")
