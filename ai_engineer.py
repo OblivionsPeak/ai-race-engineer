@@ -131,15 +131,15 @@ PERSONALITIES = {
 PERSONALITY_PROMPTS = {
     'professional': (
         "You are a calm, precise, data-driven race engineer. Speak like a real F1 engineer — "
-        "concise, factual, no fluff. Use numbers. 1-3 sentences unless detail is requested."
+        "concise, factual, no fluff. Use numbers. Maximum 2 sentences. No preamble."
     ),
     'aggressive': (
         "You are an intense, fired-up race engineer. Direct, urgent, passionate. Push the driver "
-        "hard. Short punchy sentences. 1-3 sentences unless detail is requested."
+        "hard. Short punchy sentences. Maximum 2 sentences. No preamble."
     ),
     'friendly': (
         "You are an encouraging, friendly race coach. Positive, supportive, motivational. "
-        "Warm but still data-driven. 1-3 sentences unless detail is requested."
+        "Warm but still data-driven. Maximum 2 sentences. No preamble."
     ),
 }
 DEFAULT_PERSONALITY = 'professional'
@@ -471,6 +471,7 @@ class TelemetryThread(threading.Thread):
         last_pit_repair_left    = 0.0    # track changes to fire proactive damage alerts
         last_engine_warnings    = 0      # track new engine warning bits
         last_meatball           = False  # track meatball (serviceable) flag transitions
+        last_is_on_track        = False  # detect False→True transition to absorb startup flags
         fast_tick               = 0      # counts fast-path iterations to gate slow path
         just_reconnected        = True   # absorb initial flag state silently on first tick after connect
 
@@ -600,8 +601,9 @@ class TelemetryThread(threading.Thread):
 
                 # Meatball flag (irsdk_serviceable = 0x40000) — mechanical issue
                 meatball_now = bool(session_flags & 0x40000)
-                if just_reconnected:
-                    # Absorb current state silently — don't treat pre-existing flags as new events
+                # Absorb flags on first connected tick AND when first going on-track each session
+                absorb_flags = just_reconnected or (is_on_track and not last_is_on_track)
+                if absorb_flags:
                     last_meatball        = meatball_now
                     last_engine_warnings = engine_warnings_raw
                     just_reconnected     = False
@@ -616,6 +618,7 @@ class TelemetryThread(threading.Thread):
                         self._app.after(0, lambda b=new_warn_bits:
                             self._app._on_engine_warning(b))
                     last_engine_warnings = engine_warnings_raw
+                last_is_on_track = is_on_track
 
                 # ── SLOW PATH — every 30 fast ticks (~2 Hz at 60 Hz poll) ──────────
                 # Fuel calcs, opponent parsing, ctx build — don't need every frame.
@@ -4377,11 +4380,13 @@ class App(tk.Tk):
                 diverge_pct = abs(avg_fpl - plan_fpl) / plan_fpl * 100
                 if diverge_pct >= 15:
                     direction = 'higher' if avg_fpl > plan_fpl else 'lower'
+                    _fimp2 = self._cfg.get('fuel_unit', 'gal') == 'gal'
+                    def _fpl2(l): return f"{l/3.78541:.2f}gal/lap" if _fimp2 else f"{l:.2f}L/lap"
                     msg = (f"Fuel running {diverge_pct:.0f}% {direction} than planned — "
-                           f"{avg_fpl:.2f}L/lap actual vs {plan_fpl:.2f}L planned.")
+                           f"{_fpl2(avg_fpl)} actual vs {_fpl2(plan_fpl)} planned.")
                     if direction == 'higher':
                         save_fpl = round(avg_fpl * 0.92, 2)
-                        msg += f" Save mode target: {save_fpl:.2f}L/lap."
+                        msg += f" Save mode target: {_fpl2(save_fpl)}."
                         fuel_sensor_l = tele.get('fuel_level')
                         if fuel_sensor_l and laps_until_pit and laps_until_pit > 0:
                             laps_with_save = fuel_sensor_l / save_fpl
@@ -4451,8 +4456,9 @@ class App(tk.Tk):
                 try:
                     _fuel_confirm = tele.get('fuel_level')
                     if _fuel_confirm is not None and _fuel_confirm > 5:
-                        self._say('pit_fuel_confirm',
-                                  f"Fuel on board: {_fuel_confirm:.1f} litres", 30)
+                        _fimp = self._cfg.get('fuel_unit', 'gal') == 'gal'
+                        _fcs = f"{_fuel_confirm/3.78541:.1f} gallons" if _fimp else f"{_fuel_confirm:.1f} litres"
+                        self._say('pit_fuel_confirm', f"Fuel on board: {_fcs}", 30)
                 except Exception:
                     pass
 
@@ -5270,8 +5276,9 @@ class App(tk.Tk):
         personality_key = self._cfg.get('personality', DEFAULT_PERSONALITY)
         persona_line    = PERSONALITY_PROMPTS.get(personality_key, PERSONALITY_PROMPTS[DEFAULT_PERSONALITY])
 
-        units   = self._cfg.get('units_system', 'metric')
-        imperial = (units == 'imperial')
+        units        = self._cfg.get('units_system', 'metric')
+        imperial     = (units == 'imperial')
+        fuel_imperial = self._cfg.get('fuel_unit', 'gal') == 'gal'
 
         def safe_float(v, fmt='.1f'):
             try:
@@ -5312,7 +5319,7 @@ class App(tk.Tk):
         def _fmt_fuel(litres):
             if litres is None:
                 return '?'
-            return f"{litres / 3.78541:.2f}gal" if imperial else f"{litres:.1f}L"
+            return f"{litres / 3.78541:.2f}gal" if fuel_imperial else f"{litres:.1f}L"
 
         fd_now = tele.get('fuel_delta', {})
         avg_fpl_now = fd_now.get('avg_actual_fpl')
@@ -5387,8 +5394,10 @@ class App(tk.Tk):
             lines.append(f"LAPS REMAINING: {lr}")
 
         if ns:
+            _ns_fuel = ns.get('fuel_load')
+            _ns_fuel_str = _fmt_fuel(_ns_fuel) if _ns_fuel is not None else '?'
             lines.append(
-                f"NEXT DRIVER: {ns.get('driver_name', '?')} | Fuel load: {ns.get('fuel_load', '?')}L"
+                f"NEXT DRIVER: {ns.get('driver_name', '?')} | Fuel load: {_ns_fuel_str}"
             )
 
         # Fuel delta — flag when data is still estimated
@@ -5396,8 +5405,14 @@ class App(tk.Tk):
         fuel_laps = tele.get('fuel_laps_measured', 0)
         if fd.get('avg_actual_fpl'):
             planned_fpl = plan.get('fuel_per_lap_l', '?')
+            _fpl_unit = 'gal/lap' if fuel_imperial else 'L/lap'
+            def _fmt_fpl(l):
+                if l is None or l == '?': return str(l)
+                try: return f"{float(l)/3.78541:.3f}" if fuel_imperial else f"{float(l):.3f}"
+                except (TypeError, ValueError): return str(l)
             lines.append(
-                f"FUEL DELTA: actual {fd['avg_actual_fpl']:.3f}L/lap vs planned {planned_fpl}L/lap"
+                f"FUEL DELTA: actual {_fmt_fpl(fd['avg_actual_fpl'])}{_fpl_unit}"
+                f" vs planned {_fmt_fpl(planned_fpl)}{_fpl_unit}"
                 + (f" (measured over {fuel_laps} laps)" if fuel_laps >= 3 else "")
             )
         if fuel_laps < 3:
